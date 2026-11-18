@@ -242,12 +242,43 @@ export function migrations(): string[] {
 }
 
 /**
- * migrate applies pending migrations to the database. Does nothing if the
- * database is already up to date.
+ * forkMigrations returns the list of migration SQL statements this fork adds,
+ * versioned apart from migrations() so upstream can keep its numbering.
+ * @returns Fork migration SQL statements
+ */
+export function forkMigrations(): string[] {
+  return [
+    // 0 - concurrency keys
+    `CREATE TABLE IF NOT EXISTS "openworkflow_fork_migrations" (
+      "version" INTEGER NOT NULL PRIMARY KEY
+    );
+
+    ALTER TABLE "workflow_runs" ADD COLUMN "concurrency_key" TEXT;
+
+    -- at most one started, unfinished run per key; also serves the claim's NOT EXISTS lookup
+    CREATE UNIQUE INDEX "workflow_runs_concurrency_key_started_idx"
+    ON "workflow_runs" ("namespace_id", "concurrency_key")
+    WHERE "concurrency_key" IS NOT NULL
+      AND "attempts" > 0
+      AND "status" IN ('pending', 'running', 'sleeping');
+
+    INSERT INTO "openworkflow_fork_migrations" ("version") VALUES (0);`,
+  ];
+}
+
+/**
+ * migrate applies pending migrations, then pending fork migrations, to the
+ * database. Does nothing if the database is already up to date.
  * @param db - SQLite database
  */
 export function migrate(db: Database): void {
-  if (getMigrationVersion(db) >= migrations().length - 1) return;
+  if (
+    getMigrationVersion(db) >= migrations().length - 1 &&
+    getMigrationVersion(db, "openworkflow_fork_migrations") >=
+      forkMigrations().length - 1
+  ) {
+    return;
+  }
 
   // Recheck the version under the writer lock so startup processes cannot race.
   const busyTimeoutMs = Number(
@@ -261,7 +292,11 @@ export function migrate(db: Database): void {
   }
   try {
     const version = getMigrationVersion(db);
-    for (const sql of pendingStatements(migrations(), version)) {
+    const forkVersion = getMigrationVersion(db, "openworkflow_fork_migrations");
+    for (const sql of [
+      ...pendingStatements(migrations(), version),
+      ...pendingStatements(forkMigrations(), forkVersion),
+    ]) {
       db.exec(sql);
     }
     db.exec("COMMIT");
@@ -278,22 +313,27 @@ export function migrate(db: Database): void {
 /**
  * getMigrationVersion returns the current migration version of the database.
  * @param db - SQLite database
+ * @param table - Migration table that records the applied versions
  * @returns Current migration version
  */
-function getMigrationVersion(db: Database): number {
+function getMigrationVersion(
+  db: Database,
+  table = "openworkflow_migrations",
+): number {
   // check if migrations table exists
   const existsStmt = db.prepare(`
     SELECT COUNT(*) as count
     FROM sqlite_master
-    WHERE type = 'table' AND name = 'openworkflow_migrations'
+    WHERE type = 'table' AND name = ?
   `);
   // safety: COUNT(*) returns a numeric count column for this query.
-  const existsResult = existsStmt.get() as { count: number } | null | undefined;
+  const existsResult = existsStmt.get(table) as
+    { count: number } | null | undefined;
   if (!existsResult || existsResult.count === 0) return -1;
 
   // get current version
   const versionStmt = db.prepare(
-    `SELECT MAX("version") AS "version" FROM "openworkflow_migrations";`,
+    `SELECT MAX("version") AS "version" FROM "${table}";`,
   );
   // safety: MAX(version) returns an integer, or null when the migration table is empty.
   const versionResult = versionStmt.get() as

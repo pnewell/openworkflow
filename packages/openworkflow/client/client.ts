@@ -177,6 +177,8 @@ export class OpenWorkflow {
           parentStepAttemptId: null,
           availableAt,
           deadlineAt: options?.deadlineAt ?? null,
+          id: options?.id ?? null,
+          concurrencyKey: options?.concurrencyKey ?? null,
         });
 
         setAttributes(span, workflowRunAttributes(workflowRun));
@@ -412,6 +414,16 @@ export interface WorkflowRunOptions {
    * Reusing the same key returns the existing run for up to 24 hours.
    */
   idempotencyKey?: string;
+  /**
+   * Choose the workflow run's ID. Reusing an ID returns the existing run, for
+   * as long as that run is kept. SQLite only.
+   */
+  id?: string;
+  /**
+   * Run workflow runs that share this key one at a time, in order of
+   * availableAt, then creation. SQLite only.
+   */
+  concurrencyKey?: string;
 }
 
 /**
