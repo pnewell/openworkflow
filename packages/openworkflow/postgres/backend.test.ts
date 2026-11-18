@@ -189,6 +189,38 @@ describe("BackendPostgres.fromPool", () => {
   });
 });
 
+describe("BackendPostgres.createWorkflowRun unsupported options", () => {
+  test.each([{ id: "event:1" }, { concurrencyKey: "company:1" }])(
+    "rejects %o",
+    async (option) => {
+      const pg = newPostgresMaxOne(DEFAULT_POSTGRES_URL);
+      const backend = BackendPostgres.fromPool(pg, {
+        namespaceId: randomUUID(),
+      });
+
+      try {
+        await expect(
+          backend.createWorkflowRun({
+            workflowName: "unsupported-options",
+            version: null,
+            idempotencyKey: null,
+            input: null,
+            config: {},
+            context: null,
+            parentStepAttemptNamespaceId: null,
+            parentStepAttemptId: null,
+            availableAt: null,
+            deadlineAt: null,
+            ...option,
+          }),
+        ).rejects.toThrow(/does not support run ids or concurrency keys/);
+      } finally {
+        await pg.end();
+      }
+    },
+  );
+});
+
 describe("BackendPostgres idempotency advisory locks", () => {
   test("uses a transaction-scoped advisory lock", async () => {
     const queries: string[] = [];
