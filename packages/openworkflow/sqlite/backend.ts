@@ -106,10 +106,12 @@ const STEP_ATTEMPT_OWNED_WHERE = `
 export class BackendSqlite implements Backend {
   private db: Database;
   private namespaceId: string;
+  private ownsDatabase: boolean;
 
-  private constructor(db: Database, namespaceId: string) {
+  private constructor(db: Database, namespaceId: string, ownsDatabase = true) {
     this.db = db;
     this.namespaceId = namespaceId;
+    this.ownsDatabase = ownsDatabase;
   }
 
   /**
@@ -144,6 +146,36 @@ export class BackendSqlite implements Backend {
         error,
       );
     }
+  }
+
+  /**
+   * Create a BackendSqlite instance on a database connection the application
+   * already has open, so the application's own writes and run creation can
+   * share a transaction (see {@link BackendSqlite#createWorkflowRunSync}).
+   * This will automatically run migrations unless `runMigrations` is set to
+   * false. It sets no PRAGMAs, and `stop()` leaves the connection open.
+   * Transactions the application opens on this connection must be synchronous
+   * (no `await` between BEGIN and COMMIT), because the backend runs its own
+   * transactions on the same connection whenever the application yields.
+   * @param db - Open database connection
+   * @param options - Backend options
+   * @returns A backend instance using the connection
+   */
+  static fromDatabase(
+    db: Database,
+    options?: BackendSqliteOptions,
+  ): BackendSqlite {
+    const { namespaceId, runMigrations } = {
+      namespaceId: DEFAULT_NAMESPACE_ID,
+      runMigrations: true,
+      ...options,
+    };
+
+    if (runMigrations) {
+      migrate(db);
+    }
+
+    return new BackendSqlite(db, namespaceId, false);
   }
 
   /* oxlint-disable typescript/require-await -- SQLite operations must finish synchronously, while this interface returns rejected promises on failure. */
@@ -317,14 +349,33 @@ export class BackendSqlite implements Backend {
 
   // oxlint-disable-next-line typescript/require-await
   async stop(): Promise<void> {
-    this.db.close();
+    if (this.ownsDatabase) this.db.close();
+  }
+
+  /**
+   * Create a workflow run synchronously on this connection without opening a
+   * transaction, so it commits or rolls back with the caller's open
+   * transaction. Idempotency keys are not accepted because their lookup opens
+   * a transaction; pass `id` instead.
+   * @param params - Workflow run params
+   * @returns The created workflow run, or the existing run with `params.id`
+   * @throws {Error} When `idempotencyKey` is set or the insert fails
+   */
+  createWorkflowRunSync(params: CreateWorkflowRunParams): WorkflowRun {
+    if (params.idempotencyKey !== null) {
+      throw new Error(
+        "createWorkflowRunSync does not accept an idempotencyKey; pass id instead",
+      );
+    }
+
+    return this.insertWorkflowRun(params);
   }
 
   createWorkflowRun(params: CreateWorkflowRunParams): Promise<WorkflowRun> {
     const { workflowName, idempotencyKey } = params;
 
     if (idempotencyKey === null) {
-      return Promise.resolve(this.insertWorkflowRun(params));
+      return Promise.resolve(this.createWorkflowRunSync(params));
     }
 
     try {
@@ -396,7 +447,10 @@ export class BackendSqlite implements Backend {
           status: step.status as StepAttempt["status"],
         })),
       );
-      const run = this.insertWorkflowRun(params);
+      const run = this.insertWorkflowRun({
+        ...params,
+        concurrencyKey: source?.concurrency_key ?? null,
+      });
       if (stepIndex !== null) {
         this.db
           .prepare(
@@ -430,7 +484,7 @@ export class BackendSqlite implements Backend {
   }
 
   private insertWorkflowRun(params: CreateWorkflowRunParams): WorkflowRun {
-    const id = generateUUID();
+    const id = params.id ?? generateUUID();
     const currentTime = now();
     const availableAt = params.availableAt
       ? toISO(params.availableAt)
@@ -455,10 +509,12 @@ export class BackendSqlite implements Backend {
         "parent_step_attempt_id",
         "available_at",
         "deadline_at",
+        "concurrency_key",
         "created_at",
         "updated_at"
       )
-      VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT ("namespace_id", "id") DO NOTHING
     `);
 
     stmt.run(
@@ -474,6 +530,7 @@ export class BackendSqlite implements Backend {
       parentStepAttemptId,
       availableAt,
       toISO(params.deadlineAt),
+      params.concurrencyKey ?? null,
       currentTime,
       currentTime,
     );
@@ -705,10 +762,20 @@ export class BackendSqlite implements Backend {
           AND "status" IN ('pending', 'running', 'sleeping')
           AND "available_at" <= ?
           AND ("deadline_at" IS NULL OR "deadline_at" > ?)
+          AND ("concurrency_key" IS NULL OR NOT EXISTS (
+            SELECT 1
+            FROM "workflow_runs" o
+            WHERE o."namespace_id" = "workflow_runs"."namespace_id"
+            AND o."concurrency_key" = "workflow_runs"."concurrency_key"
+            AND o."attempts" > 0
+            AND o."status" IN ('pending', 'running', 'sleeping')
+            AND o."id" <> "workflow_runs"."id"
+          ))
         ORDER BY
           CASE WHEN "status" = 'pending' THEN 0 ELSE 1 END,
           "available_at",
-          "created_at"
+          "created_at",
+          "rowid"
         LIMIT 1
       `);
 
@@ -1358,6 +1425,7 @@ export class BackendSqlite implements Backend {
 // Row types for SQLite results
 interface WorkflowRunRow extends Record<string, SQLOutputValue> {
   workflow_schedule_id: string | null;
+  concurrency_key: string | null;
   namespace_id: string;
   id: string;
   workflow_name: string;

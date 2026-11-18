@@ -355,6 +355,15 @@ export class BackendPostgres implements Backend {
   async createWorkflowRun(
     params: CreateWorkflowRunParams,
   ): Promise<WorkflowRun> {
+    if (
+      (params.id ?? null) !== null ||
+      (params.concurrencyKey ?? null) !== null
+    ) {
+      throw new Error(
+        "Postgres backend does not support run ids or concurrency keys",
+      );
+    }
+
     if (params.idempotencyKey === null) {
       return await this.insertWorkflowRun(this.pg, params);
     }

@@ -115,6 +115,19 @@ export interface CreateWorkflowRunParams {
   parentStepAttemptId: string | null;
   availableAt: Date | null; // null = immediately
   deadlineAt: Date | null; // null = no deadline
+  /**
+   * Run id chosen by the caller. Creating a run with an id that already exists
+   * creates nothing and returns the existing run, whatever its state and
+   * whatever the other params say, for as long as that run is kept. Ids are
+   * unique per namespace, across all workflows.
+   */
+  id?: string | null;
+  /**
+   * Runs that share a key run one at a time: a run is not claimed while
+   * another run with the same key has started and not finished. Waiting runs
+   * are claimed in order of availableAt, then creation.
+   */
+  concurrencyKey?: string | null;
 }
 
 export interface WorkflowScheduleIdParams {
