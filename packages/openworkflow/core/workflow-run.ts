@@ -74,6 +74,11 @@ export interface WorkflowRun {
   attempts: number;
   parentStepAttemptNamespaceId: string | null;
   parentStepAttemptId: string | null;
+  /**
+   * The run's concurrency key. Absent when the run has none, and on backends
+   * without concurrency keys. SQLite only.
+   */
+  concurrencyKey?: string;
   workerId: string | null;
   availableAt: Date | null;
   deadlineAt: Date | null;

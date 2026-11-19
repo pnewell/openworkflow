@@ -250,6 +250,26 @@ describe("BackendPostgres.upsertWorkflowSchedule unsupported options", () => {
   );
 });
 
+describe("BackendPostgres runs by concurrency key", () => {
+  test("rejects the key filter and cancel by key", async () => {
+    const pg = newPostgresMaxOne(DEFAULT_POSTGRES_URL);
+    const backend = BackendPostgres.fromPool(pg, {
+      namespaceId: randomUUID(),
+    });
+
+    try {
+      await expect(
+        backend.listWorkflowRuns({ concurrencyKey: "company:1" }),
+      ).rejects.toThrow(/does not support concurrency keys/);
+      await expect(
+        backend.cancelWorkflowRunsByConcurrencyKey(),
+      ).rejects.toThrow(/does not support concurrency keys/);
+    } finally {
+      await pg.end();
+    }
+  });
+});
+
 describe("BackendPostgres messages", () => {
   test("rejects every message method", async () => {
     const pg = newPostgresMaxOne(DEFAULT_POSTGRES_URL);

@@ -25,6 +25,7 @@ import {
   SendSignalParams,
   SendSignalResult,
   GetSignalDeliveryParams,
+  type CancelWorkflowRunsResult,
   type EnqueueScheduledRunsParams,
   type PaginationOptions,
   type SendMessageResult,
@@ -68,6 +69,8 @@ interface BackendPostgresOptions {
 
 const POSTGRES_MESSAGES_UNSUPPORTED =
   "Postgres backend does not support messages";
+const POSTGRES_CONCURRENCY_KEYS_UNSUPPORTED =
+  "Postgres backend does not support concurrency keys";
 
 const workflowRunColumns = [
   "workflow_schedule_id",
@@ -657,11 +660,19 @@ export class BackendPostgres implements Backend {
   listMessages(): Promise<PaginatedResponse<WorkflowMessage>> {
     return Promise.reject(new Error(POSTGRES_MESSAGES_UNSUPPORTED));
   }
+
+  cancelWorkflowRunsByConcurrencyKey(): Promise<CancelWorkflowRunsResult> {
+    return Promise.reject(new Error(POSTGRES_CONCURRENCY_KEYS_UNSUPPORTED));
+  }
   /* oxlint-enable eslint/class-methods-use-this */
 
   async listWorkflowRuns(
     params: ListWorkflowRunsParams,
   ): Promise<PaginatedResponse<WorkflowRun>> {
+    if (params.concurrencyKey !== undefined) {
+      throw new Error(POSTGRES_CONCURRENCY_KEYS_UNSUPPORTED);
+    }
+
     const limit = params.limit ?? DEFAULT_PAGINATION_PAGE_SIZE;
     const { after, before } = params;
     const cursor = decodeListCursor(params);

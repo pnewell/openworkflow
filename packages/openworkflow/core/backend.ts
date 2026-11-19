@@ -73,6 +73,9 @@ export interface Backend {
   cancelWorkflowRun(
     params: Readonly<CancelWorkflowRunParams>,
   ): Promise<WorkflowRun>;
+  cancelWorkflowRunsByConcurrencyKey(
+    params: Readonly<CancelWorkflowRunsByConcurrencyKeyParams>,
+  ): Promise<CancelWorkflowRunsResult>;
 
   // Step Attempts
   createStepAttempt(
@@ -161,6 +164,8 @@ export interface RerunWorkflowRunParams {
 export interface ListWorkflowRunsParams extends PaginationOptions {
   status?: WorkflowRunStatus;
   workflowName?: string;
+  /** Only runs with this concurrency key. */
+  concurrencyKey?: string;
 }
 
 export interface ClaimWorkflowRunParams {
@@ -204,6 +209,17 @@ export interface RescheduleWorkflowRunAfterFailedStepAttemptParams {
 
 export interface CancelWorkflowRunParams {
   workflowRunId: string;
+}
+
+export interface CancelWorkflowRunsByConcurrencyKeyParams {
+  concurrencyKey: string;
+  /** A run to leave alone, such as the keyed run making the call. */
+  exceptWorkflowRunId: string | null;
+}
+
+export interface CancelWorkflowRunsResult {
+  /** IDs of the runs this call canceled. */
+  workflowRunIds: string[];
 }
 
 export interface CreateStepAttemptParams {

@@ -4,6 +4,8 @@ import {
   DEFAULT_RUN_IDEMPOTENCY_PERIOD_MS,
   Backend,
   CancelWorkflowRunParams,
+  type CancelWorkflowRunsByConcurrencyKeyParams,
+  type CancelWorkflowRunsResult,
   ClaimWorkflowRunParams,
   CreateStepAttemptParams,
   CreateWorkflowRunParams,
@@ -1375,6 +1377,51 @@ export class BackendSqlite implements Backend {
     return updated;
   }
 
+  // oxlint-disable-next-line typescript/require-await -- keep the transaction synchronous
+  async cancelWorkflowRunsByConcurrencyKey(
+    params: CancelWorkflowRunsByConcurrencyKeyParams,
+  ): Promise<CancelWorkflowRunsResult> {
+    const currentTime = now();
+
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      // safety: RETURNING selects the non-null text id of each canceled run.
+      const canceled = this.db
+        .prepare(
+          `
+        UPDATE "workflow_runs"
+        SET
+          "status" = 'canceled',
+          "worker_id" = NULL,
+          "available_at" = NULL,
+          "finished_at" = ?,
+          "updated_at" = ?
+        WHERE "namespace_id" = ?
+        AND "concurrency_key" = ?
+        AND "status" IN ('pending', 'running', 'sleeping')
+        AND "id" IS NOT ?
+        RETURNING "id"
+      `,
+        )
+        .all(
+          currentTime,
+          currentTime,
+          this.namespaceId,
+          params.concurrencyKey,
+          params.exceptWorkflowRunId,
+        ) as { id: string }[];
+      const workflowRunIds = canceled.map((row) => row.id);
+      for (const id of workflowRunIds) {
+        this.wakeParentWorkflowRun({ namespaceId: this.namespaceId, id });
+      }
+      this.db.exec("COMMIT");
+      return { workflowRunIds };
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   /**
    * Return positional placeholders for {@link RUNNING_WORKFLOW_RUN_OWNED_WHERE}
    * in the order the fragment expects: namespace, run id, worker id.
@@ -1416,7 +1463,9 @@ export class BackendSqlite implements Backend {
    * by id after it was created.
    * @param childWorkflowRun - Finished workflow run
    */
-  private wakeParentWorkflowRun(childWorkflowRun: Readonly<WorkflowRun>): void {
+  private wakeParentWorkflowRun(
+    childWorkflowRun: Readonly<Pick<WorkflowRun, "namespaceId" | "id">>,
+  ): void {
     const currentTime = now();
     const stmt = this.db.prepare(`
       UPDATE "workflow_runs"
@@ -1487,6 +1536,10 @@ export class BackendSqlite implements Backend {
     if (params.workflowName) {
       conditions.push(`"workflow_name" = ?`);
       values.push(params.workflowName);
+    }
+    if (params.concurrencyKey !== undefined) {
+      conditions.push(`"concurrency_key" = ?`);
+      values.push(params.concurrencyKey);
     }
 
     if (cursor) {
@@ -1817,6 +1870,11 @@ function rowToWorkflowRun(row: WorkflowRunRow): WorkflowRun {
     attempts: row.attempts,
     parentStepAttemptNamespaceId: row.parent_step_attempt_namespace_id,
     parentStepAttemptId: row.parent_step_attempt_id,
+    // omitted when there is none, so a keyless run has the same shape as on
+    // backends without keys
+    ...(row.concurrency_key !== null && {
+      concurrencyKey: row.concurrency_key,
+    }),
     workerId: row.worker_id,
     availableAt: fromISO(row.available_at),
     deadlineAt: fromISO(row.deadline_at),

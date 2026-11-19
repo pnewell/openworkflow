@@ -1,5 +1,6 @@
 import type {
   Backend,
+  CancelWorkflowRunsResult,
   PaginatedResponse,
   PaginationOptions,
   SendMessageResult,
@@ -245,6 +246,31 @@ export class OpenWorkflow {
    */
   async cancelWorkflowRun(workflowRunId: string): Promise<void> {
     await cancelWorkflowRun(this.backend, workflowRunId);
+  }
+
+  /**
+   * Cancel every unfinished run (pending, delayed, running or parked) with the
+   * given concurrency key, in one transaction. Safe to repeat. SQLite only.
+   * @param concurrencyKey - Concurrency key whose runs to cancel
+   * @param options - Cancel options
+   * @param options.exceptWorkflowRunId - A run to leave alone, so a keyed run
+   * can cancel the rest of its key without canceling itself
+   * @returns IDs of the runs this call canceled
+   * @example
+   * ```ts
+   * await ow.cancelWorkflowRunsByConcurrencyKey("company:acme", {
+   *   exceptWorkflowRunId: run.id,
+   * });
+   * ```
+   */
+  async cancelWorkflowRunsByConcurrencyKey(
+    concurrencyKey: string,
+    options?: { exceptWorkflowRunId?: string },
+  ): Promise<CancelWorkflowRunsResult> {
+    return await this.backend.cancelWorkflowRunsByConcurrencyKey({
+      concurrencyKey,
+      exceptWorkflowRunId: options?.exceptWorkflowRunId ?? null,
+    });
   }
 
   /**

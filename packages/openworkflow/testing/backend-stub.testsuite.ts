@@ -25,6 +25,7 @@ export function createStubBackend(overrides: Partial<Backend>): Backend {
     failWorkflowRun: unexpectedBackendCall,
     rescheduleWorkflowRunAfterFailedStepAttempt: unexpectedBackendCall,
     cancelWorkflowRun: unexpectedBackendCall,
+    cancelWorkflowRunsByConcurrencyKey: unexpectedBackendCall,
     createStepAttempt: unexpectedBackendCall,
     getStepAttempt: unexpectedBackendCall,
     listStepAttempts: unexpectedBackendCall,
