@@ -27,6 +27,8 @@ import {
   GetSignalDeliveryParams,
   type EnqueueScheduledRunsParams,
   type PaginationOptions,
+  type SendMessageResult,
+  type WorkflowMessage,
   type WorkflowScheduleIdParams,
 } from "../core/backend.js";
 import {
@@ -63,6 +65,9 @@ interface BackendPostgresOptions {
   runMigrations?: boolean;
   schema?: string;
 }
+
+const POSTGRES_MESSAGES_UNSUPPORTED =
+  "Postgres backend does not support messages";
 
 const workflowRunColumns = [
   "workflow_schedule_id",
@@ -633,6 +638,20 @@ export class BackendPostgres implements Backend {
 
     return row ? (row.data ?? null) : undefined;
   }
+
+  /* oxlint-disable eslint/class-methods-use-this -- part of the Backend interface */
+  sendMessage(): Promise<SendMessageResult> {
+    return Promise.reject(new Error(POSTGRES_MESSAGES_UNSUPPORTED));
+  }
+
+  consumeMessage(): Promise<WorkflowMessage | null> {
+    return Promise.reject(new Error(POSTGRES_MESSAGES_UNSUPPORTED));
+  }
+
+  listMessages(): Promise<PaginatedResponse<WorkflowMessage>> {
+    return Promise.reject(new Error(POSTGRES_MESSAGES_UNSUPPORTED));
+  }
+  /* oxlint-enable eslint/class-methods-use-this */
 
   async listWorkflowRuns(
     params: ListWorkflowRunsParams,

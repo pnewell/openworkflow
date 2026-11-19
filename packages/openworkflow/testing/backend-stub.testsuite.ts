@@ -33,6 +33,9 @@ export function createStubBackend(overrides: Partial<Backend>): Backend {
     setStepAttemptChildWorkflowRun: unexpectedBackendCall,
     sendSignal: unexpectedBackendCall,
     getSignalDelivery: unexpectedBackendCall,
+    sendMessage: unexpectedBackendCall,
+    consumeMessage: unexpectedBackendCall,
+    listMessages: unexpectedBackendCall,
     stop: unexpectedBackendCall,
     ...overrides,
   };

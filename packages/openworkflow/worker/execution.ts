@@ -19,6 +19,7 @@ import {
   createSleepContext,
   createWorkflowContext,
   createSignalWaitContext,
+  createMessageWaitContext,
 } from "../core/step-attempt.js";
 import {
   computeFailedWorkflowRunUpdate,
@@ -31,6 +32,8 @@ import type {
   StepApi,
   StepFunction,
   StepFunctionConfig,
+  StepSendMessageOptions,
+  StepWaitForMessageOptions,
   StepWaitTimeout,
   WorkflowFunction,
 } from "../core/workflow-function.js";
@@ -361,6 +364,19 @@ function buildSignalIdempotencyKey(
   stepName: string,
 ): string {
   return `__signal:${workflowRunId}:${stepName}`;
+}
+
+/**
+ * Build deterministic idempotency key for message send invocation.
+ * @param workflowRunId - Sending workflow run id
+ * @param stepName - Step name
+ * @returns Stable idempotency key
+ */
+function buildMessageIdempotencyKey(
+  workflowRunId: string,
+  stepName: string,
+): string {
+  return `__message:${workflowRunId}:${stepName}`;
 }
 
 /**
@@ -955,20 +971,43 @@ class StepExecutor implements StepApi {
       stepAttemptId: attempt.id,
     });
 
-    if (signalData !== undefined) {
-      let outputValue: unknown = signalData;
+    return await this.resolveWait<Output>(
+      stepName,
+      attempt,
+      signalData,
+      options.schema,
+      "Signal",
+    );
+  }
 
-      if (options.schema) {
-        const validationResult = await validateInput(
-          options.schema,
-          signalData,
-        );
+  /**
+   * Complete a signal or message wait with its delivered data, or with null
+   * once its timeout has passed; otherwise park the run until the timeout.
+   * @param stepName - Wait step name
+   * @param attempt - Running wait step attempt
+   * @param delivered - Delivered data, or undefined when nothing has arrived
+   * @param schema - Optional schema for the delivered data
+   * @param label - "Signal" or "Message", for the validation error
+   * @returns The delivered data, or null on timeout
+   */
+  private async resolveWait<Output>(
+    stepName: string,
+    attempt: Readonly<StepAttempt>,
+    delivered: JsonValue | undefined,
+    schema: StandardSchemaV1<unknown, Output> | undefined,
+    label: "Signal" | "Message",
+  ): Promise<{ data: Output } | null> {
+    if (delivered !== undefined) {
+      let outputValue: unknown = delivered;
+
+      if (schema) {
+        const validationResult = await validateInput(schema, delivered);
         if (!validationResult.success) {
           return await this.failStepWithError(
             stepName,
             attempt.id,
             new Error(
-              `Signal schema validation failed: ${validationResult.error}`,
+              `${label} schema validation failed: ${validationResult.error}`,
             ),
             TERMINAL_STEP_RETRY_POLICY,
           );
@@ -994,7 +1033,8 @@ class StepExecutor implements StepApi {
   }
 
   /**
-   * Complete a signal-wait step attempt and update internal maps.
+   * Complete a signal-wait or message-wait step attempt and update internal
+   * maps.
    * @param attempt - Step attempt being completed
    * @param output - Envelope with data, or null for timeout
    * @returns The completed step output
@@ -1010,6 +1050,98 @@ class StepExecutor implements StepApi {
     );
     // safety: signal-wait steps persist either null or the data accepted by this wait operation.
     return completed.output as { data: Output } | null;
+  }
+
+  // ---- step.sendMessage ---------------------------------------------------
+
+  async sendMessage(
+    options: Readonly<StepSendMessageOptions>,
+  ): Promise<{ messageId: string }> {
+    const stepName = this.history.resolveStepName(
+      options.stepName ?? options.name,
+    );
+
+    const existingAttempt = this.history.findCached(stepName);
+    if (existingAttempt) {
+      // safety: message-send steps persist the backend result containing messageId.
+      return existingAttempt.output as { messageId: string };
+    }
+
+    const runningAttempt = this.history.findRunning(stepName);
+    const attempt =
+      runningAttempt?.kind === "message-send"
+        ? runningAttempt
+        : await this.createNewStepAttempt(stepName, "message-send", null);
+
+    try {
+      // A replay sends with the same key, so it never stores a second message.
+      const sent = await this.backend.sendMessage({
+        workflowRunId: options.workflowRunId,
+        name: options.name,
+        data: options.data ?? null,
+        idempotencyKey: buildMessageIdempotencyKey(
+          this.workflowRunId,
+          stepName,
+        ),
+      });
+      const completed = await this.completeStepAttemptAndRecord(attempt, {
+        messageId: sent.messageId,
+      });
+      // safety: message-send steps persist the backend result containing messageId.
+      return completed.output as { messageId: string };
+    } catch (error) {
+      return await this.failStepWithError(
+        stepName,
+        attempt.id,
+        error,
+        TERMINAL_STEP_RETRY_POLICY,
+      );
+    }
+  }
+
+  // ---- step.waitForMessage ------------------------------------------------
+
+  async waitForMessage<Output>(
+    options: Readonly<StepWaitForMessageOptions<Output>>,
+  ): Promise<{ data: Output } | null> {
+    const stepName = this.history.resolveStepName(
+      options.stepName ?? options.name,
+    );
+
+    const existingAttempt = this.history.findCached(stepName);
+    if (existingAttempt) {
+      // safety: message-wait steps persist either null or the data accepted by this wait operation.
+      return existingAttempt.output as { data: Output } | null;
+    }
+
+    const runningAttempt = this.history.findRunning(stepName);
+    const attempt =
+      runningAttempt?.kind === "message-wait"
+        ? runningAttempt
+        : await this.createNewStepAttempt(
+            stepName,
+            "message-wait",
+            createMessageWaitContext(
+              options.name,
+              resolveWaitTimeoutAt(options.timeout),
+            ),
+          );
+
+    // Returns the message this attempt already claimed, so a replay after a
+    // crash receives the same message.
+    const message = await this.backend.consumeMessage({
+      workflowRunId: this.workflowRunId,
+      stepAttemptId: attempt.id,
+      name: options.name,
+    });
+
+    return await this.resolveWait<Output>(
+      stepName,
+      attempt,
+      message ? message.data : undefined,
+      options.schema,
+      "Message",
+    );
   }
 }
 

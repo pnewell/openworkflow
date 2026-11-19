@@ -25,7 +25,12 @@ import {
   SendSignalResult,
   GetSignalDeliveryParams,
   toWorkflowRunCounts,
+  type ConsumeMessageParams,
   type EnqueueScheduledRunsParams,
+  type ListMessagesParams,
+  type SendMessageParams,
+  type SendMessageResult,
+  type WorkflowMessage,
   type PaginationOptions,
   type WorkflowScheduleIdParams,
 } from "../core/backend.js";
@@ -45,6 +50,7 @@ import {
 import { StepAttempt } from "../core/step-attempt.js";
 import { computeFailedWorkflowRunUpdate } from "../core/workflow-definition.js";
 import {
+  isTerminalStatus,
   resolveCancelWorkflowRunConflict,
   WorkflowRun,
 } from "../core/workflow-run.js";
@@ -720,6 +726,217 @@ export class BackendSqlite implements Backend {
     return Promise.resolve(fromJSON(row.data));
   }
 
+  /**
+   * Send a message synchronously on this connection without opening a
+   * transaction, so it commits or rolls back with the caller's open
+   * transaction. A run created earlier in the same transaction can receive
+   * it.
+   * @param params - Message params
+   * @returns The stored message's id, or the original message's id when the
+   * idempotency key was already used for this run
+   * @throws {Error} When the run does not exist or has already finished
+   */
+  sendMessageSync(params: SendMessageParams): SendMessageResult {
+    if (params.idempotencyKey !== null) {
+      // safety: the query selects the non-null text id of a stored message.
+      const existing = this.db
+        .prepare(
+          `
+        SELECT "id" FROM "workflow_messages"
+        WHERE "namespace_id" = ? AND "workflow_run_id" = ? AND "idempotency_key" = ?
+      `,
+        )
+        .get(this.namespaceId, params.workflowRunId, params.idempotencyKey) as
+        { id: string } | undefined;
+      if (existing) return { messageId: existing.id };
+    }
+
+    // safety: the query selects the run's non-null status column.
+    const run = this.db
+      .prepare(
+        `SELECT "status" FROM "workflow_runs" WHERE "namespace_id" = ? AND "id" = ?`,
+      )
+      .get(this.namespaceId, params.workflowRunId) as
+      { status: WorkflowRun["status"] } | undefined;
+    if (!run) {
+      throw new Error(`Workflow run ${params.workflowRunId} does not exist`);
+    }
+    if (isTerminalStatus(run.status)) {
+      throw new Error(
+        `Cannot send a message to workflow run ${params.workflowRunId} with status ${run.status}`,
+      );
+    }
+
+    const id = generateUUID();
+    const currentTime = now();
+    this.db
+      .prepare(
+        `
+      INSERT INTO "workflow_messages" (
+        "namespace_id", "id", "workflow_run_id", "name", "data",
+        "idempotency_key", "created_at"
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `,
+      )
+      .run(
+        this.namespaceId,
+        id,
+        params.workflowRunId,
+        params.name,
+        toJSON(params.data),
+        params.idempotencyKey,
+        currentTime,
+      );
+
+    // wake the run only if it is parked waiting for this name
+    this.db
+      .prepare(
+        `
+      UPDATE "workflow_runs"
+      SET
+        "available_at" = CASE
+          WHEN "available_at" IS NULL OR "available_at" > ? THEN ?
+          ELSE "available_at"
+        END,
+        "updated_at" = ?
+      WHERE "namespace_id" = ?
+        AND "id" = ?
+        AND "status" IN ('pending', 'running', 'sleeping')
+        AND "worker_id" IS NULL
+        AND EXISTS (
+          SELECT 1
+          FROM "step_attempts" sa
+          WHERE sa."namespace_id" = "workflow_runs"."namespace_id"
+          AND sa."workflow_run_id" = "workflow_runs"."id"
+          AND sa."kind" = 'message-wait'
+          AND sa."status" = 'running'
+          AND json_extract(sa."context", '$.name') = ?
+        )
+    `,
+      )
+      .run(
+        currentTime,
+        currentTime,
+        currentTime,
+        this.namespaceId,
+        params.workflowRunId,
+        params.name,
+      );
+
+    return { messageId: id };
+  }
+
+  // oxlint-disable-next-line typescript/require-await -- keep the transaction synchronous
+  async sendMessage(params: SendMessageParams): Promise<SendMessageResult> {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const result = this.sendMessageSync(params);
+      this.db.exec("COMMIT");
+      return result;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  // oxlint-disable-next-line typescript/require-await -- keep the transaction synchronous
+  async consumeMessage(
+    params: ConsumeMessageParams,
+  ): Promise<WorkflowMessage | null> {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      // safety: these queries select workflow_messages columns defined by our SQLite migrations.
+      const claimed = this.db
+        .prepare(
+          `
+        SELECT * FROM "workflow_messages"
+        WHERE "namespace_id" = ? AND "consumed_by_step_attempt_id" = ?
+      `,
+        )
+        .get(this.namespaceId, params.stepAttemptId) as
+        WorkflowMessageRow | undefined;
+      // safety: these queries select workflow_messages columns defined by our SQLite migrations.
+      const row =
+        claimed ??
+        (this.db
+          .prepare(
+            `
+        UPDATE "workflow_messages"
+        SET "consumed_by_step_attempt_id" = ?, "consumed_at" = ?
+        WHERE "rowid" = (
+          SELECT "rowid" FROM "workflow_messages"
+          WHERE "namespace_id" = ?
+            AND "workflow_run_id" = ?
+            AND "name" = ?
+            AND "consumed_by_step_attempt_id" IS NULL
+          ORDER BY "created_at", "rowid"
+          LIMIT 1
+        )
+        AND EXISTS (
+          SELECT 1
+          FROM "step_attempts"
+          WHERE "namespace_id" = ?
+          AND "id" = ?
+          AND "workflow_run_id" = ?
+          AND "kind" = 'message-wait'
+          AND "status" = 'running'
+        )
+        RETURNING *
+      `,
+          )
+          .get(
+            params.stepAttemptId,
+            now(),
+            this.namespaceId,
+            params.workflowRunId,
+            params.name,
+            this.namespaceId,
+            params.stepAttemptId,
+            params.workflowRunId,
+          ) as WorkflowMessageRow | undefined);
+      this.db.exec("COMMIT");
+      return row ? rowToWorkflowMessage(row) : null;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  listMessages(
+    params: ListMessagesParams,
+  ): Promise<PaginatedResponse<WorkflowMessage>> {
+    const limit = params.limit ?? DEFAULT_PAGINATION_PAGE_SIZE;
+    const { after, before } = params;
+    const cursor = decodeListCursor(params);
+
+    const conditions = ['"namespace_id" = ?', '"workflow_run_id" = ?'];
+    const values: unknown[] = [this.namespaceId, params.workflowRunId];
+    if (cursor) {
+      const op = before ? "<" : ">";
+      conditions.push(`("created_at", "id") ${op} (?, ?)`);
+      values.push(cursor.createdAt.toISOString(), cursor.id);
+    }
+
+    const order = before ? "DESC" : "ASC";
+    const stmt = this.db.prepare(`
+      SELECT * FROM "workflow_messages"
+      WHERE ${conditions.join(" AND ")}
+      ORDER BY "created_at" ${order}, "id" ${order}
+      LIMIT ?
+    `);
+    // safety: this query selects workflow_messages columns defined by our SQLite migrations.
+    const rows = stmt.all(...values, limit + 1) as WorkflowMessageRow[];
+    return Promise.resolve(
+      buildPaginatedResponse(
+        rows.map((row) => rowToWorkflowMessage(row)),
+        limit,
+        !!after,
+        !!before,
+      ),
+    );
+  }
+
   async claimWorkflowRun(
     params: ClaimWorkflowRunParams,
   ): Promise<WorkflowRun | null> {
@@ -880,6 +1097,19 @@ export class BackendSqlite implements Backend {
               WHERE sa."namespace_id" = "workflow_runs"."namespace_id"
               AND sa."workflow_run_id" = "workflow_runs"."id"
               AND sa."kind" = 'signal-wait'
+              AND sa."status" = 'running'
+            )
+            OR EXISTS (
+              SELECT 1
+              FROM "step_attempts" sa
+              JOIN "workflow_messages" wm
+                ON wm."namespace_id" = sa."namespace_id"
+                AND wm."workflow_run_id" = sa."workflow_run_id"
+                AND wm."name" = json_extract(sa."context", '$.name')
+                AND wm."consumed_by_step_attempt_id" IS NULL
+              WHERE sa."namespace_id" = "workflow_runs"."namespace_id"
+              AND sa."workflow_run_id" = "workflow_runs"."id"
+              AND sa."kind" = 'message-wait'
               AND sa."status" = 'running'
             )
           ) AND ? > ? THEN ?
@@ -1564,6 +1794,37 @@ function rowToStepAttempt(row: StepAttemptRow): StepAttempt {
     finishedAt: fromISO(row.finished_at),
     createdAt,
     updatedAt,
+  };
+}
+
+interface WorkflowMessageRow extends Record<string, SQLOutputValue> {
+  namespace_id: string;
+  id: string;
+  workflow_run_id: string;
+  name: string;
+  data: string | null;
+  idempotency_key: string | null;
+  consumed_by_step_attempt_id: string | null;
+  consumed_at: string | null;
+  created_at: string;
+}
+
+/**
+ * Convert a SQLite row to a message.
+ * @param row - Persisted message
+ * @returns Message with parsed JSON and timestamps
+ */
+function rowToWorkflowMessage(row: WorkflowMessageRow): WorkflowMessage {
+  return {
+    namespaceId: row.namespace_id,
+    id: row.id,
+    workflowRunId: row.workflow_run_id,
+    name: row.name,
+    data: fromJSON(row.data),
+    idempotencyKey: row.idempotency_key,
+    consumedByStepAttemptId: row.consumed_by_step_attempt_id,
+    consumedAt: fromISO(row.consumed_at),
+    createdAt: new Date(row.created_at),
   };
 }
 

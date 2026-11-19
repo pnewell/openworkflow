@@ -221,6 +221,29 @@ describe("BackendPostgres.createWorkflowRun unsupported options", () => {
   );
 });
 
+describe("BackendPostgres messages", () => {
+  test("rejects every message method", async () => {
+    const pg = newPostgresMaxOne(DEFAULT_POSTGRES_URL);
+    const backend = BackendPostgres.fromPool(pg, {
+      namespaceId: randomUUID(),
+    });
+
+    try {
+      await expect(backend.sendMessage()).rejects.toThrow(
+        /does not support messages/,
+      );
+      await expect(backend.consumeMessage()).rejects.toThrow(
+        /does not support messages/,
+      );
+      await expect(backend.listMessages()).rejects.toThrow(
+        /does not support messages/,
+      );
+    } finally {
+      await pg.end();
+    }
+  });
+});
+
 describe("BackendPostgres idempotency advisory locks", () => {
   test("uses a transaction-scoped advisory lock", async () => {
     const queries: string[] = [];

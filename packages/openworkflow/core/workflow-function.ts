@@ -47,9 +47,36 @@ export interface StepRunWorkflowOptions {
 }
 
 /**
+ * Options for `step.sendMessage()`.
+ */
+export interface StepSendMessageOptions {
+  /** Workflow run the message is addressed to. */
+  workflowRunId: string;
+  /** Message name the receiving run waits on. */
+  name: string;
+  data?: JsonValue;
+  /** Optional durable step name. Defaults to the message name. */
+  stepName?: string;
+}
+
+/**
+ * Options for `step.waitForMessage()`.
+ */
+export interface StepWaitForMessageOptions<Output> {
+  /** Message name. Each wait takes the oldest unread message with it. */
+  name: string;
+  /** Optional durable step name. Defaults to the message name. */
+  stepName?: string;
+  /** Maximum time to wait. Defaults to 1 year. */
+  timeout?: StepWaitTimeout;
+  schema?: StandardSchemaV1<unknown, Output>;
+}
+
+/**
  * Represents the API for defining steps within a workflow. Used within a
  * workflow handler to define steps by calling `step.run()`, `step.sleep()`,
- * `step.runWorkflow()`, `step.sendSignal()`, and `step.waitForSignal()`.
+ * `step.runWorkflow()`, `step.sendSignal()`, `step.waitForSignal()`,
+ * `step.sendMessage()`, and `step.waitForMessage()`.
  */
 export interface StepApi {
   run: <Output>(
@@ -76,6 +103,12 @@ export interface StepApi {
       timeout?: StepWaitTimeout;
       schema?: StandardSchemaV1<unknown, Output>;
     }>,
+  ) => Promise<{ data: Output } | null>;
+  sendMessage: (
+    options: Readonly<StepSendMessageOptions>,
+  ) => Promise<{ messageId: string }>;
+  waitForMessage: <Output>(
+    options: Readonly<StepWaitForMessageOptions<Output>>,
   ) => Promise<{ data: Output } | null>;
 }
 

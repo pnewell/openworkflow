@@ -84,7 +84,7 @@ export function defaultWaitTimeoutAt(base: Readonly<Date> = new Date()): Date {
 
 /**
  * Extract the timeout from a persisted step attempt's context.
- * Works for both workflow and signal-wait step types.
+ * Works for workflow, signal-wait and message-wait step types.
  * @param attempt - Running step attempt
  * @returns Timeout deadline, or null when context has no timeout
  */
@@ -93,7 +93,8 @@ export function getContextTimeoutAt(
 ): Date | null {
   if (
     attempt.context?.kind !== "workflow" &&
-    attempt.context?.kind !== "signal-wait"
+    attempt.context?.kind !== "signal-wait" &&
+    attempt.context?.kind !== "message-wait"
   ) {
     return null;
   }
@@ -101,7 +102,7 @@ export function getContextTimeoutAt(
   const { timeoutAt } = attempt.context;
   if (timeoutAt === null) {
     // backward compatibility for previously persisted workflow contexts
-    // (signal-wait timeoutAt is never null per SignalWaitStepAttemptContext).
+    // (signal-wait and message-wait timeoutAt are never null).
     return defaultWaitTimeoutAt(attempt.createdAt);
   }
   return new Date(timeoutAt);
@@ -124,7 +125,11 @@ function getRunningWaitAttemptResumeAt(
     return Number.isFinite(resumeAt.getTime()) ? resumeAt : null;
   }
 
-  if (attempt.kind !== "signal-wait" && attempt.kind !== "workflow") {
+  if (
+    attempt.kind !== "signal-wait" &&
+    attempt.kind !== "message-wait" &&
+    attempt.kind !== "workflow"
+  ) {
     return null;
   }
 

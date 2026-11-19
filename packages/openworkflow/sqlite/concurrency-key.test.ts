@@ -637,8 +637,12 @@ describe("concurrency keys (SQLite)", () => {
         migrate(db);
 
         expect(migrationVersion(db, "openworkflow_migrations")).toBe(7);
-        expect(count(db, "openworkflow_fork_migrations")).toBe(1);
-        expect(migrationVersion(db, "openworkflow_fork_migrations")).toBe(0);
+        expect(count(db, "openworkflow_fork_migrations")).toBe(
+          forkMigrations().length,
+        );
+        expect(migrationVersion(db, "openworkflow_fork_migrations")).toBe(
+          forkMigrations().length - 1,
+        );
         expect(
           db
             .prepare(
@@ -662,7 +666,9 @@ describe("concurrency keys (SQLite)", () => {
 
         expect(migrationVersion(db, "openworkflow_migrations")).toBe(7);
         expect(count(db, "workflow_schedules")).toBe(0);
-        expect(count(db, "openworkflow_fork_migrations")).toBe(1);
+        expect(count(db, "openworkflow_fork_migrations")).toBe(
+          forkMigrations().length,
+        );
       } finally {
         db.close();
       }

@@ -8,6 +8,7 @@ import {
   createSleepContext,
   createWorkflowContext,
   createSignalWaitContext,
+  createMessageWaitContext,
 } from "./step-attempt.js";
 import type { StepAttempt, StepAttemptCache } from "./step-attempt.js";
 import { describe, expect, test } from "vitest";
@@ -357,6 +358,19 @@ describe("createSignalWaitContext", () => {
     const context = createSignalWaitContext("test-signal", timeoutAt);
 
     expect(context.timeoutAt).toBe("2025-01-01T00:00:00.123Z");
+  });
+});
+
+describe("createMessageWaitContext", () => {
+  test("creates message-wait context with name and timeout", () => {
+    const timeoutAt = new Date("2025-06-15T10:30:00.000Z");
+    const context = createMessageWaitContext("approval", timeoutAt);
+
+    expect(context).toEqual({
+      kind: "message-wait",
+      name: "approval",
+      timeoutAt: "2025-06-15T10:30:00.000Z",
+    });
   });
 });
 

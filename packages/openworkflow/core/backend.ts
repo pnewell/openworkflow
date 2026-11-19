@@ -100,6 +100,15 @@ export interface Backend {
     params: Readonly<GetSignalDeliveryParams>,
   ): Promise<JsonValue | undefined>;
 
+  // Messages
+  sendMessage(params: Readonly<SendMessageParams>): Promise<SendMessageResult>;
+  consumeMessage(
+    params: Readonly<ConsumeMessageParams>,
+  ): Promise<WorkflowMessage | null>;
+  listMessages(
+    params: Readonly<ListMessagesParams>,
+  ): Promise<PaginatedResponse<WorkflowMessage>>;
+
   // Lifecycle
   stop(): Promise<void>;
 }
@@ -249,6 +258,48 @@ export interface SendSignalResult {
 
 export interface GetSignalDeliveryParams {
   stepAttemptId: string;
+}
+
+export interface SendMessageParams {
+  workflowRunId: string;
+  name: string;
+  data: JsonValue | null;
+  /**
+   * Unique per workflow run, with no expiry: a repeated send with the same key
+   * stores nothing and returns the original message.
+   */
+  idempotencyKey: string | null;
+}
+
+export interface SendMessageResult {
+  messageId: string;
+}
+
+export interface ConsumeMessageParams {
+  workflowRunId: string;
+  stepAttemptId: string;
+  name: string;
+}
+
+export interface ListMessagesParams extends PaginationOptions {
+  workflowRunId: string;
+}
+
+/**
+ * A message addressed to one workflow run, stored until a message wait in that
+ * run consumes it.
+ */
+export interface WorkflowMessage {
+  namespaceId: string;
+  id: string;
+  workflowRunId: string;
+  name: string;
+  data: JsonValue | null;
+  idempotencyKey: string | null;
+  /** The message-wait step attempt that consumed it, or null while pending. */
+  consumedByStepAttemptId: string | null;
+  consumedAt: Date | null;
+  createdAt: Date;
 }
 
 export interface PaginationOptions {

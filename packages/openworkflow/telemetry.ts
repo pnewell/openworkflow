@@ -145,7 +145,11 @@ export function stepAttemptAttributes(
     [ATTRIBUTE_NAMES.WORKFLOW_RUN_ID]: attempt.workflowRunId,
     [ATTRIBUTE_NAMES.STEP_NAME]: attempt.stepName,
   };
-  if (attempt.kind !== "function" && attempt.kind !== "signal-send") {
+  if (
+    attempt.kind !== "function" &&
+    attempt.kind !== "signal-send" &&
+    attempt.kind !== "message-send"
+  ) {
     attributes[ATTRIBUTE_NAMES.STEP_KIND] = attempt.kind;
   }
   if (attempt.childWorkflowRunId) {

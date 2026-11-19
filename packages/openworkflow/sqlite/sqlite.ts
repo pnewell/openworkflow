@@ -263,6 +263,40 @@ export function forkMigrations(): string[] {
       AND "status" IN ('pending', 'running', 'sleeping');
 
     INSERT INTO "openworkflow_fork_migrations" ("version") VALUES (0);`,
+
+    // 1 - workflow messages
+    `CREATE TABLE "workflow_messages" (
+      "namespace_id" TEXT NOT NULL,
+      "id" TEXT NOT NULL,
+      --
+      "workflow_run_id" TEXT NOT NULL,
+      "name" TEXT NOT NULL,
+      "data" TEXT,
+      "idempotency_key" TEXT,
+      "consumed_by_step_attempt_id" TEXT,
+      "consumed_at" TEXT,
+      "created_at" TEXT NOT NULL,
+      PRIMARY KEY ("namespace_id", "id"),
+      FOREIGN KEY ("namespace_id", "workflow_run_id")
+        REFERENCES "workflow_runs" ("namespace_id", "id")
+        ON DELETE CASCADE
+    );
+
+    CREATE UNIQUE INDEX "workflow_messages_idempotency_idx"
+    ON "workflow_messages" ("namespace_id", "workflow_run_id", "idempotency_key")
+    WHERE "idempotency_key" IS NOT NULL;
+
+    -- pending messages in arrival order (rowid breaks created_at ties)
+    CREATE INDEX "workflow_messages_pending_idx"
+    ON "workflow_messages" ("namespace_id", "workflow_run_id", "name", "created_at")
+    WHERE "consumed_by_step_attempt_id" IS NULL;
+
+    -- at most one message per message-wait step attempt
+    CREATE UNIQUE INDEX "workflow_messages_consumed_by_idx"
+    ON "workflow_messages" ("namespace_id", "consumed_by_step_attempt_id")
+    WHERE "consumed_by_step_attempt_id" IS NOT NULL;
+
+    INSERT INTO "openworkflow_fork_migrations" ("version") VALUES (1);`,
   ];
 }
 

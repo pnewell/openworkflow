@@ -2,7 +2,9 @@ import type {
   Backend,
   PaginatedResponse,
   PaginationOptions,
+  SendMessageResult,
   SendSignalResult,
+  WorkflowMessage,
 } from "../core/backend.js";
 import type { DurationString } from "../core/duration.js";
 import type { JsonValue } from "../core/json.js";
@@ -304,6 +306,57 @@ export class OpenWorkflow {
         return result;
       },
     );
+  }
+
+  /**
+   * Send a message to one workflow run. The message is stored until a
+   * `step.waitForMessage()` with the same name in that run reads it, so it is
+   * safe to send before the run reaches the wait, while no worker is running,
+   * or twice with the same idempotency key. SQLite only.
+   * @param options - Message options
+   * @param options.workflowRunId - Run the message is addressed to
+   * @param options.name - Message name the run waits on
+   * @param options.data - Message payload
+   * @param options.idempotencyKey - Unique per run, with no expiry: a repeated
+   * send stores nothing and returns the original message's id
+   * @returns ID of the stored message
+   * @throws {Error} When the run does not exist or has already finished
+   * @example
+   * ```ts
+   * await ow.sendMessage({
+   *   workflowRunId: run.workflowRun.id,
+   *   name: "approval",
+   *   data: { approved: true },
+   *   idempotencyKey: `approval:${purchaseId}`,
+   * });
+   * ```
+   */
+  async sendMessage(
+    options: Readonly<{
+      workflowRunId: string;
+      name: string;
+      data?: JsonValue;
+      idempotencyKey?: string;
+    }>,
+  ): Promise<SendMessageResult> {
+    return await this.backend.sendMessage({
+      workflowRunId: options.workflowRunId,
+      name: options.name,
+      data: options.data ?? null,
+      idempotencyKey: options.idempotencyKey ?? null,
+    });
+  }
+
+  /**
+   * List a workflow run's messages, pending and consumed, by creation time,
+   * with the step attempt that consumed each. SQLite only.
+   * @param options - Run ID and pagination options
+   * @returns Page of messages
+   */
+  async listMessages(
+    options: Readonly<{ workflowRunId: string } & PaginationOptions>,
+  ): Promise<PaginatedResponse<WorkflowMessage>> {
+    return await this.backend.listMessages(options);
   }
 }
 
