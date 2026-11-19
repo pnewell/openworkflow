@@ -399,6 +399,8 @@ interface RunWorkflowStepRequest<
   workflowSpec: WorkflowSpec<Input, Output, RunInput>;
   input: RunInput | undefined;
   timeout: number | string | Date | undefined;
+  id: string | undefined;
+  concurrencyKey: string | undefined;
 }
 
 /**
@@ -557,6 +559,8 @@ class StepExecutor implements StepApi {
       workflowSpec: spec,
       input,
       timeout: options?.timeout,
+      id: options?.id,
+      concurrencyKey: options?.concurrencyKey,
     };
 
     const existingAttempt = this.history.findCached(stepName);
@@ -752,6 +756,8 @@ class StepExecutor implements StepApi {
           parentStepAttemptId: attempt.id,
           availableAt: null,
           deadlineAt: null,
+          id: request.id ?? null,
+          concurrencyKey: request.concurrencyKey ?? null,
         });
         setAttributes(span, workflowRunAttributes(run));
         return run;

@@ -44,6 +44,18 @@ export interface StepRunWorkflowOptions {
    * Maximum time to wait for the child workflow to complete.
    */
   timeout?: StepWaitTimeout;
+  /**
+   * Choose the child run's ID. If a run with this ID already exists, the
+   * parent waits on that run and nothing new is created. SQLite only.
+   */
+  id?: string;
+  /**
+   * Give the child run a concurrency key, so it queues behind other runs with
+   * the key. A parent with no key holds no key while it waits. A parent keeps
+   * its own key while it waits, so the child's key must differ from the
+   * parent's. SQLite only.
+   */
+  concurrencyKey?: string;
 }
 
 /**

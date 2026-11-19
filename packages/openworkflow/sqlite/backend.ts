@@ -490,6 +490,7 @@ export class BackendSqlite implements Backend {
   }
 
   private insertWorkflowRun(params: CreateWorkflowRunParams): WorkflowRun {
+    this.assertChildKeyDiffersFromParent(params);
     const id = params.id ?? generateUUID();
     const currentTime = now();
     const availableAt = params.availableAt
@@ -555,6 +556,45 @@ export class BackendSqlite implements Backend {
     requireRow(row, "create workflow run");
 
     return rowToWorkflowRun(row);
+  }
+
+  /**
+   * Refuse a child run whose concurrency key is its parent's. The parent holds
+   * its key while it waits, so the child could never be claimed.
+   * @param params - Workflow run params
+   * @throws {Error} When the child's key equals the parent run's key
+   */
+  private assertChildKeyDiffersFromParent(
+    params: CreateWorkflowRunParams,
+  ): void {
+    if (
+      (params.concurrencyKey ?? null) === null ||
+      params.parentStepAttemptId === null
+    ) {
+      return;
+    }
+
+    // safety: the query selects the parent run's nullable concurrency_key column.
+    const parent = this.db
+      .prepare(
+        `
+      SELECT wr."concurrency_key"
+      FROM "step_attempts" sa
+      JOIN "workflow_runs" wr
+        ON wr."namespace_id" = sa."namespace_id"
+        AND wr."id" = sa."workflow_run_id"
+      WHERE sa."namespace_id" = ? AND sa."id" = ?
+    `,
+      )
+      .get(
+        params.parentStepAttemptNamespaceId ?? this.namespaceId,
+        params.parentStepAttemptId,
+      ) as { concurrency_key: string | null } | undefined;
+    if (parent?.concurrency_key === params.concurrencyKey) {
+      throw new Error(
+        `A child workflow run cannot use its parent's concurrency key "${String(params.concurrencyKey)}": the parent holds the key while it waits, so the child would never run`,
+      );
+    }
   }
 
   private getWorkflowRunByIdempotencyKey(
@@ -1343,14 +1383,13 @@ export class BackendSqlite implements Backend {
     ];
   }
 
+  /**
+   * Wake every parked run with a running workflow step linked to the finished
+   * run. That is its creating parent, and also any parent that chose the run
+   * by id after it was created.
+   * @param childWorkflowRun - Finished workflow run
+   */
   private wakeParentWorkflowRun(childWorkflowRun: Readonly<WorkflowRun>): void {
-    if (
-      !childWorkflowRun.parentStepAttemptNamespaceId ||
-      !childWorkflowRun.parentStepAttemptId
-    ) {
-      return;
-    }
-
     const currentTime = now();
     const stmt = this.db.prepare(`
       UPDATE "workflow_runs"
@@ -1361,16 +1400,14 @@ export class BackendSqlite implements Backend {
         END,
         "updated_at" = ?
       WHERE "namespace_id" = ?
-      AND "id" = (
+      AND "id" IN (
         SELECT "workflow_run_id"
         FROM "step_attempts"
         WHERE "namespace_id" = ?
-        AND "id" = ?
         AND "kind" = 'workflow'
         AND "status" = 'running'
         AND "child_workflow_run_namespace_id" = ?
         AND "child_workflow_run_id" = ?
-        LIMIT 1
       )
       AND (
         "status" = 'sleeping'
@@ -1382,9 +1419,8 @@ export class BackendSqlite implements Backend {
       currentTime,
       currentTime,
       currentTime,
-      childWorkflowRun.parentStepAttemptNamespaceId,
-      childWorkflowRun.parentStepAttemptNamespaceId,
-      childWorkflowRun.parentStepAttemptId,
+      this.namespaceId,
+      this.namespaceId,
       childWorkflowRun.namespaceId,
       childWorkflowRun.id,
     );
