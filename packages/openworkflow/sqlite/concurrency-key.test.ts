@@ -658,9 +658,11 @@ describe("concurrency keys (SQLite)", () => {
     test("still apply an upstream migration added after them", () => {
       const db = newDatabase(":memory:");
       try {
-        // upstream before migration 7, with the fork migrations already applied
+        // upstream before migration 7, with the first fork migration already
+        // applied (later fork migrations need upstream 7, which migrate()
+        // always applies first)
         for (const sql of migrations().slice(0, 7)) db.exec(sql);
-        for (const sql of forkMigrations()) db.exec(sql);
+        for (const sql of forkMigrations().slice(0, 1)) db.exec(sql);
 
         migrate(db);
 

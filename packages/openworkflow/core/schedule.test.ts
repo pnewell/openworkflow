@@ -30,6 +30,29 @@ describe("schedule registration validation", () => {
     ).rejects.toThrow("unversioned workflow");
   });
 
+  test("defaults to no concurrency key and allowing overlap, and keeps given options", async () => {
+    expect(
+      await prepareWorkflowSchedule(spec, undefined, { cron: "0 * * * *" }),
+    ).toMatchObject({ concurrencyKey: null, overlap: "allow" });
+    expect(
+      await prepareWorkflowSchedule(spec, undefined, {
+        cron: "0 * * * *",
+        concurrencyKey: "company:acme",
+        overlap: "skip",
+      }),
+    ).toMatchObject({ concurrencyKey: "company:acme", overlap: "skip" });
+  });
+
+  test("rejects an unknown overlap rule", async () => {
+    await expect(
+      prepareWorkflowSchedule(spec, undefined, {
+        cron: "0 * * * *",
+        // safety: deliberately invalid, as from an untyped JavaScript caller.
+        overlap: "buffer" as "skip",
+      }),
+    ).rejects.toThrow('Schedule overlap must be "allow" or "skip"');
+  });
+
   test("defaults to the exact workflow name and UTC and accepts weekday names", async () => {
     expect(
       await prepareWorkflowSchedule(spec, undefined, { cron: "0 9 * * THU" }),

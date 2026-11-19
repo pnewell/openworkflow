@@ -244,6 +244,12 @@ export class BackendPostgres implements Backend {
   async upsertWorkflowSchedule(
     params: WorkflowScheduleDefinition,
   ): Promise<WorkflowSchedule> {
+    if ((params.concurrencyKey ?? null) !== null || params.overlap === "skip") {
+      throw new Error(
+        "Postgres backend does not support schedule concurrency keys or overlap rules",
+      );
+    }
+
     const pg = this.pg;
     const now = new Date();
     const [row] = await pg<WorkflowSchedule[]>`

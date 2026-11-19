@@ -681,7 +681,9 @@ describe("messages (SQLite)", () => {
       migrate(db);
       migrate(db);
 
-      expect(count(db, "openworkflow_fork_migrations")).toBe(2);
+      expect(count(db, "openworkflow_fork_migrations")).toBe(
+        forkMigrations().length,
+      );
       const backend = BackendSqlite.fromDatabase(db, { runMigrations: false });
       backend.sendMessageSync({
         workflowRunId: "existing",

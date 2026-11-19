@@ -46,6 +46,7 @@ import {
   nextScheduleOccurrence,
   type WorkflowSchedule,
   type WorkflowScheduleDefinition,
+  type WorkflowScheduleOverlap,
 } from "../core/schedule.js";
 import { StepAttempt } from "../core/step-attempt.js";
 import { computeFailedWorkflowRunUpdate } from "../core/workflow-definition.js";
@@ -194,11 +195,13 @@ export class BackendSqlite implements Backend {
       .prepare(
         `
       INSERT INTO workflow_schedules
-        (namespace_id,id,workflow_name,input,cron,timezone,next_run_at,created_at,updated_at)
-      VALUES (?,?,?,?,?,?,?,?,?)
+        (namespace_id,id,workflow_name,input,cron,timezone,next_run_at,created_at,updated_at,
+         concurrency_key,overlap)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?)
       ON CONFLICT(namespace_id,id) DO UPDATE SET
         workflow_name=excluded.workflow_name, input=excluded.input,
         cron=excluded.cron, timezone=excluded.timezone, updated_at=excluded.updated_at,
+        concurrency_key=excluded.concurrency_key, overlap=excluded.overlap,
         next_run_at=CASE WHEN workflow_schedules.next_run_at IS NOT NULL
           AND (workflow_schedules.cron<>excluded.cron OR workflow_schedules.timezone<>excluded.timezone)
           THEN excluded.next_run_at ELSE workflow_schedules.next_run_at END
@@ -215,6 +218,8 @@ export class BackendSqlite implements Backend {
         nextScheduleOccurrence(params, now).toISOString(),
         now.toISOString(),
         now.toISOString(),
+        params.concurrencyKey ?? null,
+        params.overlap ?? "allow",
       ) as WorkflowScheduleRow;
     return rowToWorkflowSchedule(row);
   }
@@ -311,20 +316,35 @@ export class BackendSqlite implements Backend {
       // safety: SELECT reads due schedules while holding the writer lock.
       const rows = this.db
         .prepare(
-          `SELECT id,workflow_name,input,cron,timezone FROM workflow_schedules
+          `SELECT id,workflow_name,input,cron,timezone,next_run_at,concurrency_key,overlap
+        FROM workflow_schedules
         WHERE namespace_id=? AND next_run_at<=? ORDER BY next_run_at,id LIMIT ?`,
         )
         .all(this.namespaceId, before, params.limit) as Pick<
         WorkflowScheduleRow,
-        "id" | "workflow_name" | "input" | "cron" | "timezone"
+        | "id"
+        | "workflow_name"
+        | "input"
+        | "cron"
+        | "timezone"
+        | "next_run_at"
+        | "concurrency_key"
+        | "overlap"
       >[];
       const update = this.db
         .prepare(`UPDATE workflow_schedules SET next_run_at=?,updated_at=?
         WHERE namespace_id=? AND id=?`);
+      // the id is derived from the schedule and the tick's nominal time, so a
+      // tick creates at most one run however often it is processed
       const insert = this.db.prepare(`INSERT INTO workflow_runs
         (namespace_id,id,workflow_name,status,config,input,attempts,
-         workflow_schedule_id,available_at,created_at,updated_at)
-        VALUES (?,?,?,'pending','{}',?,0,?,?,?,?)`);
+         workflow_schedule_id,available_at,concurrency_key,created_at,updated_at)
+        VALUES (?,?,?,'pending','{}',?,0,?,?,?,?,?)
+        ON CONFLICT (namespace_id,id) DO NOTHING`);
+      const unfinished = this.db.prepare(`SELECT 1 FROM workflow_runs
+        WHERE namespace_id=? AND workflow_schedule_id=?
+          AND status IN ('pending','running','sleeping')
+        LIMIT 1`);
       for (const row of rows) {
         update.run(
           nextScheduleOccurrence(row, params.before).toISOString(),
@@ -332,14 +352,21 @@ export class BackendSqlite implements Backend {
           this.namespaceId,
           row.id,
         );
+        if (
+          row.overlap === "skip" &&
+          unfinished.get(this.namespaceId, row.id)
+        ) {
+          continue;
+        }
         const currentTime = now();
         insert.run(
           this.namespaceId,
-          generateUUID(),
+          `__schedule:${row.id}:${String(row.next_run_at)}`,
           row.workflow_name,
           row.input,
           row.id,
           before,
+          row.concurrency_key,
           currentTime,
           currentTime,
         );
@@ -1872,6 +1899,8 @@ interface WorkflowScheduleRow extends Record<string, SQLOutputValue> {
   cron: string;
   timezone: string;
   next_run_at: string | null;
+  concurrency_key: string | null;
+  overlap: string;
   created_at: string;
   updated_at: string;
 }
@@ -1889,6 +1918,9 @@ function rowToWorkflowSchedule(row: WorkflowScheduleRow): WorkflowSchedule {
     input: fromJSON(row.input),
     cron: row.cron,
     timezone: row.timezone,
+    concurrencyKey: row.concurrency_key,
+    // safety: the overlap column is written from WorkflowScheduleOverlap values.
+    overlap: row.overlap as WorkflowScheduleOverlap,
     nextRunAt: fromISO(row.next_run_at),
     createdAt: new Date(row.created_at),
     updatedAt: new Date(row.updated_at),

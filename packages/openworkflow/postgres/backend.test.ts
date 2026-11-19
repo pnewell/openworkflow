@@ -221,6 +221,35 @@ describe("BackendPostgres.createWorkflowRun unsupported options", () => {
   );
 });
 
+describe("BackendPostgres.upsertWorkflowSchedule unsupported options", () => {
+  test.each([{ concurrencyKey: "company:1" }, { overlap: "skip" as const }])(
+    "rejects %o",
+    async (option) => {
+      const pg = newPostgresMaxOne(DEFAULT_POSTGRES_URL);
+      const backend = BackendPostgres.fromPool(pg, {
+        namespaceId: randomUUID(),
+      });
+
+      try {
+        await expect(
+          backend.upsertWorkflowSchedule({
+            id: "report",
+            workflowName: "report",
+            input: null,
+            cron: "0 * * * *",
+            timezone: "UTC",
+            ...option,
+          }),
+        ).rejects.toThrow(
+          /does not support schedule concurrency keys or overlap rules/,
+        );
+      } finally {
+        await pg.end();
+      }
+    },
+  );
+});
+
 describe("BackendPostgres messages", () => {
   test("rejects every message method", async () => {
     const pg = newPostgresMaxOne(DEFAULT_POSTGRES_URL);

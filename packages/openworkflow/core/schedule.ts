@@ -3,6 +3,13 @@ import type { WorkflowSpec } from "./workflow-definition.js";
 import { validateInput } from "./workflow-run.js";
 import { CronExpressionParser, type CronExpression } from "cron-parser";
 
+/**
+ * What a schedule does when a tick comes due while an earlier run it created
+ * is unfinished: `"allow"` creates the run anyway, `"skip"` creates nothing
+ * for that tick.
+ */
+export type WorkflowScheduleOverlap = "allow" | "skip";
+
 /** Options shared by startup declarations and runtime schedule registration. */
 export interface WorkflowScheduleOptions {
   /** Defaults to the exact workflow name, within the backend namespace. */
@@ -11,6 +18,13 @@ export interface WorkflowScheduleOptions {
   cron: string;
   /** IANA timezone; defaults to UTC. */
   timezone?: string;
+  /**
+   * Concurrency key for the runs this schedule creates, so they queue behind
+   * other runs with the key. SQLite only.
+   */
+  concurrencyKey?: string;
+  /** Defaults to `"allow"`. SQLite only for `"skip"`. */
+  overlap?: WorkflowScheduleOverlap;
 }
 
 /** Validated declaration persisted by the backend using last-write-wins. */
@@ -20,6 +34,10 @@ export interface WorkflowScheduleDefinition {
   input: JsonValue | null;
   cron: string;
   timezone: string;
+  /** Absent or null means the schedule's runs have no key. */
+  concurrencyKey?: string | null;
+  /** Absent means `"allow"`. */
+  overlap?: WorkflowScheduleOverlap;
 }
 
 /** A recurring schedule and its current dispatch cursor. */
@@ -52,6 +70,11 @@ export async function prepareWorkflowSchedule<Input, Output, RunInput>(
   const expression = parseSchedule(options.cron, timezone, new Date());
   // Also reject expressions with no possible future occurrence.
   expression.next();
+  const overlap = options.overlap ?? "allow";
+  // Validate untyped JavaScript callers too.
+  if (!["allow", "skip"].includes(overlap)) {
+    throw new Error('Schedule overlap must be "allow" or "skip"');
+  }
   const result = await validateInput(spec.schema, input);
   if (!result.success) throw new Error(result.error);
   return {
@@ -60,6 +83,8 @@ export async function prepareWorkflowSchedule<Input, Output, RunInput>(
     input: result.value ?? null,
     cron: expression.stringify(true),
     timezone,
+    concurrencyKey: options.concurrencyKey ?? null,
+    overlap,
   };
 }
 

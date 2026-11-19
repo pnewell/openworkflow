@@ -297,6 +297,12 @@ export function forkMigrations(): string[] {
     WHERE "consumed_by_step_attempt_id" IS NOT NULL;
 
     INSERT INTO "openworkflow_fork_migrations" ("version") VALUES (1);`,
+
+    // 2 - schedule concurrency keys and overlap
+    `ALTER TABLE "workflow_schedules" ADD COLUMN "concurrency_key" TEXT;
+    ALTER TABLE "workflow_schedules" ADD COLUMN "overlap" TEXT NOT NULL DEFAULT 'allow';
+
+    INSERT INTO "openworkflow_fork_migrations" ("version") VALUES (2);`,
   ];
 }
 
