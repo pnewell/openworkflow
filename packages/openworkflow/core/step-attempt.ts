@@ -11,6 +11,7 @@ export type StepKind =
   | "function"
   | "sleep"
   | "workflow"
+  | "workflow-start"
   | "signal-send"
   | "signal-wait"
   | "message-send"

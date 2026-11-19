@@ -59,6 +59,35 @@ export interface StepRunWorkflowOptions {
 }
 
 /**
+ * Options for `step.startWorkflow()`.
+ */
+export interface StepStartWorkflowOptions {
+  /**
+   * Optional durable step name. Defaults to the target workflow name.
+   */
+  name?: string;
+  /**
+   * Choose the started run's ID. Defaults to an ID derived from this run's ID
+   * and the step name, so the step can never start two runs. If a run with
+   * the ID already exists, nothing is created and its ID is returned.
+   */
+  id?: string;
+  /**
+   * Give the started run a concurrency key, so it queues behind other runs
+   * with the key. It may be this run's own key, since nothing waits.
+   */
+  concurrencyKey?: string;
+  /**
+   * Start the run later: an absolute Date or a duration string.
+   */
+  availableAt?: Date | DurationString;
+  /**
+   * Fail the started run if it has not finished by then.
+   */
+  deadlineAt?: Date;
+}
+
+/**
  * Options for `step.sendMessage()`.
  */
 export interface StepSendMessageOptions {
@@ -87,8 +116,8 @@ export interface StepWaitForMessageOptions<Output> {
 /**
  * Represents the API for defining steps within a workflow. Used within a
  * workflow handler to define steps by calling `step.run()`, `step.sleep()`,
- * `step.runWorkflow()`, `step.sendSignal()`, `step.waitForSignal()`,
- * `step.sendMessage()`, and `step.waitForMessage()`.
+ * `step.runWorkflow()`, `step.startWorkflow()`, `step.sendSignal()`,
+ * `step.waitForSignal()`, `step.sendMessage()`, and `step.waitForMessage()`.
  */
 export interface StepApi {
   run: <Output>(
@@ -100,6 +129,11 @@ export interface StepApi {
     input?: RunInput,
     options?: Readonly<StepRunWorkflowOptions>,
   ) => Promise<Output>;
+  startWorkflow: <Input, Output, RunInput = Input>(
+    spec: WorkflowSpec<Input, Output, RunInput>,
+    input?: RunInput,
+    options?: Readonly<StepStartWorkflowOptions>,
+  ) => Promise<string>;
   sleep: (name: string, duration: DurationString) => Promise<void>;
   sendSignal: (
     options: Readonly<{

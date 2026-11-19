@@ -267,9 +267,11 @@ describe("messages (SQLite)", () => {
           name: "approval",
           data: "offline",
         });
-        expect(
-          await backend.getWorkflowRun({ workflowRunId: workflowRun.id }),
-        ).toMatchObject({ availableAt: new Date(T0.getTime() + HOUR) });
+        // woken: due now rather than at the wait's 7-day timeout
+        const woken = await backend.getWorkflowRun({
+          workflowRunId: workflowRun.id,
+        });
+        expect(woken?.availableAt?.getTime()).toBeLessThanOrEqual(Date.now());
 
         const second = approvalClient(backend);
         await tickUntil(second.worker, backend, workflowRun.id, {

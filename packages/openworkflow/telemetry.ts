@@ -148,7 +148,8 @@ export function stepAttemptAttributes(
   if (
     attempt.kind !== "function" &&
     attempt.kind !== "signal-send" &&
-    attempt.kind !== "message-send"
+    attempt.kind !== "message-send" &&
+    attempt.kind !== "workflow-start"
   ) {
     attributes[ATTRIBUTE_NAMES.STEP_KIND] = attempt.kind;
   }

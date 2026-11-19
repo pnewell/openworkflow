@@ -33,6 +33,7 @@ import type {
   StepFunction,
   StepFunctionConfig,
   StepSendMessageOptions,
+  StepStartWorkflowOptions,
   StepWaitForMessageOptions,
   StepWaitTimeout,
   WorkflowFunction,
@@ -242,6 +243,22 @@ function resolveWaitTimeoutAt(
   if (!result.ok) {
     throw result.error;
   }
+  return result.value;
+}
+
+/**
+ * Resolve a started run's availableAt to an absolute Date or null.
+ * @param availableAt - Absolute Date or duration string from now
+ * @returns Absolute Date, or null to start immediately
+ * @throws {Error} When the duration string is invalid
+ */
+function resolveStartAvailableAt(
+  availableAt: Date | DurationString | undefined,
+): Date | null {
+  if (availableAt === undefined) return null;
+  if (availableAt instanceof Date) return availableAt;
+  const result = calculateDateFromDuration(availableAt);
+  if (!result.ok) throw result.error;
   return result.value;
 }
 
@@ -775,6 +792,63 @@ class StepExecutor implements StepApi {
     this.history.replaceRunningAttempt(linked);
 
     return linked;
+  }
+
+  // ---- step.startWorkflow -------------------------------------------------
+
+  async startWorkflow<Input, Output, RunInput = Input>(
+    spec: WorkflowSpec<Input, Output, RunInput>,
+    input?: RunInput,
+    options?: Readonly<StepStartWorkflowOptions>,
+  ): Promise<string> {
+    const stepName = this.history.resolveStepName(options?.name ?? spec.name);
+
+    const existingAttempt = this.history.findCached(stepName);
+    if (existingAttempt) {
+      // safety: workflow-start steps persist the started run's id.
+      return (existingAttempt.output as { workflowRunId: string })
+        .workflowRunId;
+    }
+
+    const runningAttempt = this.history.findRunning(stepName);
+    const attempt =
+      runningAttempt?.kind === "workflow-start"
+        ? runningAttempt
+        : await this.createNewStepAttempt(stepName, "workflow-start", null);
+
+    try {
+      const validationResult = await validateInput(spec.schema, input);
+      if (!validationResult.success) {
+        throw new Error(validationResult.error);
+      }
+      const run = await this.backend.createWorkflowRun({
+        workflowName: spec.name,
+        version: spec.version ?? null,
+        idempotencyKey: null,
+        config: {},
+        context: captureTraceContext(),
+        input: normalizeStepOutput(validationResult.value),
+        // no parent link: the started run's outcome never affects this run
+        parentStepAttemptNamespaceId: null,
+        parentStepAttemptId: null,
+        availableAt: resolveStartAvailableAt(options?.availableAt),
+        deadlineAt: options?.deadlineAt ?? null,
+        // a replay after a crash at any point finds the same run
+        id: options?.id ?? `__start:${this.workflowRunId}:${stepName}`,
+        concurrencyKey: options?.concurrencyKey ?? null,
+      });
+      await this.completeStepAttemptAndRecord(attempt, {
+        workflowRunId: run.id,
+      });
+      return run.id;
+    } catch (error) {
+      return await this.failStepWithError(
+        stepName,
+        attempt.id,
+        error,
+        TERMINAL_STEP_RETRY_POLICY,
+      );
+    }
   }
 
   /**
