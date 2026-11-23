@@ -277,11 +277,19 @@ maps to a distinct step attempt.
 ### 4.1. Step Failures & Retries
 
 When a step's function throws an error, the framework records the error in the
-`step_attempt` and sets its status to `failed`. The error then propagates up.
-Retry scheduling for that failure is driven by the failed-attempt count for that
-specific `stepName` in the workflow run. If retryable, the workflow run is
-rescheduled by setting `availableAt` to the computed backoff time. On the next
-execution, replay reaches the failed step and re-executes its function.
+`step_attempt` and sets its status to `failed`. Retry scheduling for that
+failure is driven by the failed-attempt count for that specific `stepName` in
+the workflow run. If retryable, the execution ends there without returning to
+the workflow code, and the workflow run is rescheduled by setting `availableAt`
+to the computed backoff time. On the next execution, replay reaches the failed
+step and re-executes its function.
+
+Because a retryable failure never reaches the workflow code, a `try/catch`
+around a step does not stop the step's retries: the `catch` runs only after the
+step's final failure, and a `finally` runs only once the step has succeeded or
+failed for good. A final failure propagates up into the workflow code and is
+replayed like a result: on later executions the step is not run again and the
+saved error is thrown again.
 
 To prevent runaway workflows from accumulating unbounded step history, execution
 enforces a default hard cap of 1000 step attempts per workflow run. When that

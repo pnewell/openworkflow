@@ -81,32 +81,26 @@ describe("StepHistory", () => {
       expect(history.findCached("b")).toBeUndefined();
     });
 
-    test("findTerminallyFailedWorkflow requires linked child ids", () => {
-      const unlinked = createMockStepAttempt({
+    test("findFailed returns the latest failed attempt", () => {
+      const first = createMockStepAttempt({
+        id: "first",
         stepName: "a",
-        kind: "workflow",
         status: "failed",
       });
-      const linked = createMockStepAttempt({
+      const latest = createMockStepAttempt({
+        id: "latest",
+        stepName: "a",
+        status: "failed",
+      });
+      const completed = createMockStepAttempt({
         stepName: "b",
-        kind: "workflow",
-        status: "failed",
-        childWorkflowRunNamespaceId: "default",
-        childWorkflowRunId: "child-run",
-      });
-      const nonWorkflow = createMockStepAttempt({
-        stepName: "c",
-        kind: "function",
-        status: "failed",
+        status: "completed",
       });
 
-      const history = new StepHistory({
-        attempts: [unlinked, linked, nonWorkflow],
-      });
+      const history = new StepHistory({ attempts: [first, latest, completed] });
 
-      expect(history.findTerminallyFailedWorkflow("a")).toBeUndefined();
-      expect(history.findTerminallyFailedWorkflow("b")).toBe(linked);
-      expect(history.findTerminallyFailedWorkflow("c")).toBeUndefined();
+      expect(history.findFailed("a")).toBe(latest);
+      expect(history.findFailed("b")).toBeUndefined();
     });
 
     test("findConflictingSignalWait matches signal name, excluding caller", () => {

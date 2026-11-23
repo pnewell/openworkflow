@@ -258,6 +258,112 @@ describe("StepExecutor", () => {
     await expect(handle.result()).rejects.toThrow(/deadline exceeded/);
   });
 
+  test("step retry cannot be caught and skips finally until the step fails for good", async () => {
+    const backend = await createTestBackend();
+    const client = new OpenWorkflow({ backend });
+    let caught = 0;
+    let finalized = 0;
+
+    const workflow = client.defineWorkflow(
+      { name: `step-retry-try-catch-${randomUUID()}` },
+      async ({ step }) => {
+        try {
+          await step.run(
+            {
+              name: "always-fails",
+              retryPolicy: { initialInterval: "50ms", maximumAttempts: 2 },
+            },
+            () => {
+              throw new Error("boom");
+            },
+          );
+        } catch {
+          caught += 1;
+        } finally {
+          finalized += 1;
+        }
+        return "recovered";
+      },
+    );
+
+    const handle = await workflow.run();
+    const worker = client.newWorker();
+    await tickUntilStatus(
+      backend,
+      worker,
+      handle.workflowRun.id,
+      "pending",
+      200,
+      10,
+    );
+    expect(caught).toBe(0);
+    expect(finalized).toBe(0);
+
+    const retrying = await backend.getWorkflowRun({
+      workflowRunId: handle.workflowRun.id,
+    });
+    if (!retrying?.availableAt) throw new Error("Expected availableAt");
+    await sleepUntilAfter(retrying.availableAt);
+    await worker.tick();
+
+    await expect(handle.result()).resolves.toBe("recovered");
+    expect(caught).toBe(1);
+    expect(finalized).toBe(1);
+  });
+
+  test("replays a final step failure as a StepError without running the step again", async () => {
+    const backend = await createTestBackend();
+    const client = new OpenWorkflow({ backend });
+    const original = new TypeError("boom");
+    const caught: Error[] = [];
+    let stepRuns = 0;
+
+    const workflow = client.defineWorkflow(
+      {
+        name: `step-final-failure-replay-${randomUUID()}`,
+        retryPolicy: { initialInterval: "10ms", maximumAttempts: 2 },
+      },
+      async ({ step }) => {
+        try {
+          await step.run(
+            { name: "fails-once", retryPolicy: { maximumAttempts: 1 } },
+            () => {
+              stepRuns += 1;
+              throw original;
+            },
+          );
+        } catch (error) {
+          if (!(error instanceof Error)) throw error;
+          caught.push(error);
+        }
+        throw new Error("after catch");
+      },
+    );
+
+    const handle = await workflow.run();
+    const worker = client.newWorker();
+    const status = await tickUntilTerminal(
+      backend,
+      worker,
+      handle.workflowRun.id,
+      200,
+      10,
+    );
+
+    expect(status).toBe("failed");
+    expect(stepRuns).toBe(1);
+    expect(caught).toHaveLength(2);
+    for (const error of caught) {
+      expect(error.name).toBe("StepError");
+      expect(error.cause).toMatchObject({
+        name: "TypeError",
+        message: "boom",
+        stack: original.stack,
+      });
+      expect(error.cause).not.toBe(original);
+    }
+  });
+
   test("sleep parks workflow in running status", async () => {
     const backend = await createTestBackend();
     const client = new OpenWorkflow({ backend });
@@ -3118,6 +3224,48 @@ describe("StepExecutor", () => {
     expect(status).toBe("failed");
   });
 
+  test("waitForSignal does not wait again after a caught schema validation failure", async () => {
+    const backend = await createTestBackend();
+    const client = new OpenWorkflow({ backend });
+    const signalString = `bad-schema-replay-signal-${randomUUID()}`;
+
+    const waiter = client.defineWorkflow(
+      { name: `signal-bad-schema-replay-${randomUUID()}` },
+      async ({ step }) => {
+        try {
+          await step.waitForSignal({
+            signal: signalString,
+            timeout: 30_000,
+            schema: z.object({ approved: z.boolean() }),
+          });
+        } catch {
+          await step.sleep("after-failure", "10ms");
+          return "recovered";
+        }
+        return "received";
+      },
+    );
+
+    const worker = client.newWorker({ concurrency: 2 });
+    const waiterHandle = await waiter.run();
+    await tickUntilParked(backend, worker, waiterHandle.workflowRun.id, 20, 50);
+
+    await client.sendSignal({
+      signal: signalString,
+      data: { approved: "not-a-boolean" },
+    });
+
+    const status = await tickUntilTerminal(
+      backend,
+      worker,
+      waiterHandle.workflowRun.id,
+      20,
+      50,
+    );
+    expect(status).toBe("completed");
+    await expect(waiterHandle.result()).resolves.toBe("recovered");
+  });
+
   test("sendSignal is replay-safe across re-executions", async () => {
     const backend = await createTestBackend();
     const client = new OpenWorkflow({ backend });
@@ -3389,6 +3537,42 @@ describe("StepExecutor", () => {
       50,
     );
     expect(status).toBe("failed");
+    sendSignalSpy.mockRestore();
+  });
+
+  test("sendSignal does not send again after a caught send failure", async () => {
+    const backend = await createTestBackend();
+    const client = new OpenWorkflow({ backend });
+
+    const sendSignalSpy = vi
+      .spyOn(backend, "sendSignal")
+      .mockRejectedValueOnce(new Error("signal delivery failed"));
+
+    const workflow = client.defineWorkflow(
+      { name: `signal-send-error-replay-${randomUUID()}` },
+      async ({ step }) => {
+        try {
+          await step.sendSignal({ signal: "will-fail", data: null });
+        } catch {
+          await step.sleep("after-failure", "10ms");
+          return "recovered";
+        }
+        return "sent";
+      },
+    );
+
+    const worker = client.newWorker();
+    const handle = await workflow.run();
+    const status = await tickUntilTerminal(
+      backend,
+      worker,
+      handle.workflowRun.id,
+      20,
+      50,
+    );
+    expect(status).toBe("completed");
+    await expect(handle.result()).resolves.toBe("recovered");
+    expect(sendSignalSpy).toHaveBeenCalledTimes(1);
     sendSignalSpy.mockRestore();
   });
 });

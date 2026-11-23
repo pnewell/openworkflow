@@ -21,8 +21,9 @@ When a step throws an error:
 4. The step function executes again
 
 Steps are attempted up to 10 times by default (one initial attempt plus up to
-nine retries). If the step still fails after all attempts, the workflow is
-permanently marked as `failed`.
+nine retries). If the step still fails after all attempts, its error is thrown
+into the workflow. Unless the workflow [catches it](#error-handling), the
+workflow is permanently marked as `failed`.
 
 To prevent runaway executions, each workflow run also has a hard cap of 1000
 total step attempts. If the run reaches that cap, it fails immediately and is
@@ -159,6 +160,7 @@ Retries happen when:
 Retries do not happen for:
 
 - Completed steps (cached results are returned)
+- Steps that have failed for good (the saved error is thrown again)
 - Explicitly canceled workflows
 - Workflow-level errors (unless a workflow `retryPolicy` is configured)
 
@@ -180,10 +182,48 @@ defineWorkflow({ name: "with-error-handling" }, async ({ input, step }) => {
 });
 ```
 
-<Note>
-  When you catch an error the workflow continues normally. The step is still
-  recorded as failed, but no retry is triggered.
-</Note>
+Catching a step error does not stop the step's retries. While the step has
+retries left, a failure ends the execution and the workflow is rescheduled, so
+the `catch` runs only after the step's final failure. A `finally` around a step
+runs only once the step has succeeded or failed for good.
+
+A final failure is saved like a result. When the workflow replays, the step is
+not run again and the saved error is thrown again, so the workflow takes the
+same branch every time.
+
+The caught error has the `name` `"StepError"`. Its `cause` carries the name,
+message, and stack saved from the step's final failure, not the original error
+object:
+
+```ts
+try {
+  await step.run({ name: "risky-operation" }, async () => {
+    await externalApi.call();
+  });
+} catch (error) {
+  if (error instanceof Error && error.name === "StepError") {
+    console.error("Step failed:", error.cause);
+  }
+}
+```
+
+To run the `catch` on a step's first failure, set the step to one attempt so
+its first failure is final:
+
+```ts
+try {
+  await step.run(
+    { name: "risky-operation", retryPolicy: { maximumAttempts: 1 } },
+    async () => {
+      await externalApi.call();
+    },
+  );
+} catch (error) {
+  await step.run({ name: "fallback" }, async () => {
+    await fallbackApi.call();
+  });
+}
+```
 
 ## Terminal Failures
 

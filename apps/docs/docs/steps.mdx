@@ -212,8 +212,15 @@ await step.run({ name: "risky-operation" }, async () => {
 });
 ```
 
-Steps that throw are marked as failed. The workflow can be retried, and failed
-steps will re-execute (not return cached results).
+Steps that throw are marked as failed. While a step has
+[retries](/docs/retries) left, a failure ends the execution and the step
+re-executes when the workflow resumes. Once the step has failed for good, its
+error is thrown into the workflow and saved like a result: on replay the step
+is not run again and the saved error is thrown again.
+
+A `try/catch` around a step does not stop the step's retries. The `catch` runs
+only after the step's final failure, and a `finally` around a step runs only
+once the step has succeeded or failed for good.
 
 A `try/catch` around `step.sleep()`, `step.runWorkflow()`, or
 `step.waitForSignal()` cannot catch the pause while the workflow waits, and a

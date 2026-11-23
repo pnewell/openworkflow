@@ -265,23 +265,12 @@ export class StepHistory {
   }
 
   /**
-   * Find a previously-failed workflow step attempt that already created a
-   * child workflow run. Workflow steps are terminal once a failure is
-   * persisted with linkage: the caller should surface the failure instead of
-   * spawning another child.
+   * Find the latest failed attempt for a step.
    * @param stepName - Resolved step name
-   * @returns Terminally-failed workflow attempt, or undefined
+   * @returns Latest failed attempt, or undefined
    */
-  findTerminallyFailedWorkflow(stepName: string): StepAttempt | undefined {
-    const attempt = this.failedByStepName.get(stepName);
-    if (
-      attempt?.kind === "workflow" &&
-      attempt.childWorkflowRunNamespaceId &&
-      attempt.childWorkflowRunId
-    ) {
-      return attempt;
-    }
-    return undefined;
+  findFailed(stepName: string): StepAttempt | undefined {
+    return this.failedByStepName.get(stepName);
   }
 
   /**
