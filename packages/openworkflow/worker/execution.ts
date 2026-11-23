@@ -36,6 +36,7 @@ import type {
 } from "../core/workflow-function.js";
 import {
   isTerminalStatus,
+  validateConcurrencyKey,
   validateInput,
   type WorkflowRun,
 } from "../core/workflow-run.js";
@@ -400,6 +401,7 @@ export interface StepExecutorOptions {
   workflowName: string;
   workerId: string;
   deadlineAt: Date | null;
+  concurrencyKey: string | null;
   history: StepHistory;
   executionFence: ExecutionFenceController;
 }
@@ -412,6 +414,7 @@ interface RunWorkflowStepRequest<
   workflowSpec: WorkflowSpec<Input, Output, RunInput>;
   input: RunInput | undefined;
   timeout: number | string | Date | undefined;
+  concurrencyKey: string | undefined;
 }
 
 /**
@@ -424,6 +427,7 @@ class StepExecutor implements StepApi {
   private readonly workflowName: string;
   private readonly workerId: string;
   private readonly deadlineAt: Date | null;
+  private readonly concurrencyKey: string | null;
   private readonly history: StepHistory;
   private readonly executionFence: ExecutionFenceController;
 
@@ -433,6 +437,7 @@ class StepExecutor implements StepApi {
     this.workflowName = options.workflowName;
     this.workerId = options.workerId;
     this.deadlineAt = options.deadlineAt;
+    this.concurrencyKey = options.concurrencyKey;
     this.history = options.history;
     this.executionFence = options.executionFence;
   }
@@ -579,6 +584,7 @@ class StepExecutor implements StepApi {
       workflowSpec: spec,
       input,
       timeout: options?.timeout,
+      concurrencyKey: options?.concurrencyKey,
     };
 
     const existingAttempt = this.history.findCached(stepName);
@@ -600,6 +606,13 @@ class StepExecutor implements StepApi {
     }
 
     // First encounter — create the workflow step and child workflow run
+    validateConcurrencyKey(request.concurrencyKey);
+    if (request.concurrencyKey === this.concurrencyKey) {
+      // the child could never start while this run waits on it
+      throw new Error(
+        `Workflow step "${stepName}" cannot run a child workflow with the concurrency key held by its own workflow run`,
+      );
+    }
     const timeoutAt = resolveWaitTimeoutAt(request.timeout);
     const attempt = await this.createNewStepAttempt(
       stepName,
@@ -753,6 +766,7 @@ class StepExecutor implements StepApi {
           version: request.workflowSpec.version ?? null,
           idempotencyKey: buildWorkflowIdempotencyKey(attempt),
           idempotencyPeriodMs: 0,
+          concurrencyKey: request.concurrencyKey ?? null,
           config: {},
           context: captureTraceContext(),
           input: normalizeStepOutput(parsedInput),
@@ -1281,6 +1295,7 @@ async function executeWorkflowAttempt(
       workflowName: workflowRun.workflowName,
       workerId,
       deadlineAt: workflowRun.deadlineAt,
+      concurrencyKey: workflowRun.concurrencyKey,
       history,
       executionFence,
     });

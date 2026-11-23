@@ -447,6 +447,7 @@ export class BackendSqlite implements Backend {
         "version",
         "status",
         "idempotency_key",
+        "concurrency_key",
         "config",
         "context",
         "input",
@@ -458,7 +459,7 @@ export class BackendSqlite implements Backend {
         "created_at",
         "updated_at"
       )
-      VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
     `);
 
     stmt.run(
@@ -467,6 +468,7 @@ export class BackendSqlite implements Backend {
       params.workflowName,
       params.version,
       params.idempotencyKey,
+      params.concurrencyKey ?? null,
       toJSON(params.config),
       toJSON(params.context),
       toJSON(params.input),
@@ -700,11 +702,37 @@ export class BackendSqlite implements Backend {
       // 2. find an available workflow run to claim
       const findStmt = this.db.prepare(`
         SELECT "id"
-        FROM "workflow_runs"
+        FROM "workflow_runs" AS c
         WHERE "namespace_id" = ?
           AND "status" IN ('pending', 'running', 'sleeping')
           AND "available_at" <= ?
           AND ("deadline_at" IS NULL OR "deadline_at" > ?)
+          AND (
+            "concurrency_key" IS NULL
+            OR "attempts" > 0
+            OR (
+              NOT EXISTS (
+                SELECT 1
+                FROM "workflow_runs" AS holder
+                WHERE holder."namespace_id" = c."namespace_id"
+                  AND holder."concurrency_key" = c."concurrency_key"
+                  AND holder."status" IN ('pending', 'running', 'sleeping')
+                  AND holder."attempts" > 0
+                  AND (holder."deadline_at" IS NULL OR holder."deadline_at" > ?)
+              )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM "workflow_runs" AS ahead
+                WHERE ahead."namespace_id" = c."namespace_id"
+                  AND ahead."concurrency_key" = c."concurrency_key"
+                  AND ahead."status" IN ('pending', 'running', 'sleeping')
+                  AND ahead."attempts" = 0
+                  AND (ahead."deadline_at" IS NULL OR ahead."deadline_at" > ?)
+                  AND (ahead."available_at", ahead."created_at", ahead.rowid)
+                    < (c."available_at", c."created_at", c.rowid)
+              )
+            )
+          )
         ORDER BY
           CASE WHEN "status" = 'pending' THEN 0 ELSE 1 END,
           "available_at",
@@ -715,6 +743,8 @@ export class BackendSqlite implements Backend {
       // safety: the query selects the workflow_runs non-null text id column, or returns no row.
       const candidate = findStmt.get(
         this.namespaceId,
+        currentTime,
+        currentTime,
         currentTime,
         currentTime,
       ) as { id: string } | null | undefined;
@@ -1364,6 +1394,7 @@ interface WorkflowRunRow extends Record<string, SQLOutputValue> {
   version: string | null;
   status: string;
   idempotency_key: string | null;
+  concurrency_key: string | null;
   config: string;
   context: string | null;
   input: string | null;
@@ -1447,6 +1478,7 @@ function rowToWorkflowRun(row: WorkflowRunRow): WorkflowRun {
     // safety: the status column is written by backend transitions using the domain status values.
     status: row.status as WorkflowRun["status"],
     idempotencyKey: row.idempotency_key,
+    concurrencyKey: row.concurrency_key,
     config,
     context: fromJSON(row.context),
     input: fromJSON(row.input),

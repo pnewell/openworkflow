@@ -44,6 +44,11 @@ export interface StepRunWorkflowOptions {
    * Maximum time to wait for the child workflow to complete.
    */
   timeout?: StepWaitTimeout;
+  /**
+   * Concurrency key for the child workflow run. Cannot be the key held by
+   * the run that calls the step.
+   */
+  concurrencyKey?: string;
 }
 
 /**

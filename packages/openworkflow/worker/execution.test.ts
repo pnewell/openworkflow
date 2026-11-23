@@ -968,6 +968,76 @@ describe("StepExecutor", () => {
     await expect(handle.result()).rejects.toThrow(/not-a-duration/);
   });
 
+  test("fails workflow when child concurrency key is empty", async () => {
+    const backend = await createTestBackend();
+    const client = new OpenWorkflow({ backend });
+
+    const parent = client.defineWorkflow(
+      { name: `workflow-parent-empty-concurrency-key-${randomUUID()}` },
+      async ({ step }) => {
+        await step.runWorkflow(
+          { name: `workflow-child-empty-concurrency-key-${randomUUID()}` },
+          undefined,
+          { concurrencyKey: "" },
+        );
+        return "never";
+      },
+    );
+
+    const worker = client.newWorker();
+    const handle = await parent.run();
+    const status = await tickUntilTerminal(
+      backend,
+      worker,
+      handle.workflowRun.id,
+      150,
+      10,
+    );
+
+    expect(status).toBe("failed");
+    await expect(handle.result()).rejects.toThrow(
+      /A concurrency key must be a nonempty string/,
+    );
+  });
+
+  test("refuses a child workflow with the concurrency key held by its own run", async () => {
+    const backend = await createTestBackend();
+    const client = new OpenWorkflow({ backend });
+    const concurrencyKey = randomUUID();
+
+    const parent = client.defineWorkflow(
+      { name: `workflow-parent-own-concurrency-key-${randomUUID()}` },
+      async ({ step }) => {
+        await step.runWorkflow(
+          { name: `workflow-child-own-concurrency-key-${randomUUID()}` },
+          undefined,
+          { concurrencyKey },
+        );
+        return "never";
+      },
+    );
+
+    const worker = client.newWorker();
+    const handle = await parent.run(undefined, { concurrencyKey });
+    const status = await tickUntilTerminal(
+      backend,
+      worker,
+      handle.workflowRun.id,
+      150,
+      10,
+    );
+
+    expect(status).toBe("failed");
+    await expect(handle.result()).rejects.toThrow(
+      /cannot run a child workflow with the concurrency key held by its own workflow run/,
+    );
+    const steps = await backend.listStepAttempts({
+      workflowRunId: handle.workflowRun.id,
+      limit: 100,
+    });
+    expect(steps.data).toHaveLength(0);
+  });
+
   test("validates child input before creating child run", async () => {
     const backend = await createTestBackend();
     const client = new OpenWorkflow({ backend });
@@ -1727,6 +1797,78 @@ describe("StepExecutor", () => {
     );
     expect(childrenForWorkflowAttempt).toHaveLength(1);
 
+    const childStatus = await tickUntilStatus(
+      backend,
+      worker,
+      childRunId,
+      "completed",
+      250,
+      10,
+    );
+    expect(childStatus).toBe("completed");
+  });
+
+  test("workflow timeout counts the time a child waits for its concurrency key", async () => {
+    const backend = await createTestBackend();
+    const client = new OpenWorkflow({ backend });
+    const concurrencyKey = randomUUID();
+
+    const holder = client.defineWorkflow(
+      { name: `workflow-key-holder-${randomUUID()}` },
+      async ({ step }) => {
+        await step.sleep("wait", "1h");
+      },
+    );
+    const child = client.defineWorkflow(
+      { name: `workflow-child-key-timeout-${randomUUID()}` },
+      () => ({ ok: true }),
+    );
+    const parent = client.defineWorkflow(
+      { name: `workflow-parent-key-timeout-${randomUUID()}` },
+      async ({ step }) => {
+        return await step.runWorkflow(child.workflow.spec, undefined, {
+          concurrencyKey,
+          timeout: "100ms",
+        });
+      },
+    );
+
+    const worker = client.newWorker({ concurrency: 2 });
+    const holderHandle = await holder.run(undefined, { concurrencyKey });
+    await tickUntilParked(
+      backend,
+      worker,
+      holderHandle.workflowRun.id,
+      100,
+      10,
+    );
+
+    const handle = await parent.run();
+    const parentStatus = await tickUntilTerminal(
+      backend,
+      worker,
+      handle.workflowRun.id,
+      250,
+      10,
+    );
+    expect(parentStatus).toBe("failed");
+    await expect(handle.result()).rejects.toThrow(
+      /Timed out waiting for child workflow to complete/,
+    );
+
+    const steps = await backend.listStepAttempts({
+      workflowRunId: handle.workflowRun.id,
+      limit: 100,
+    });
+    const childRunId = steps.data[0]?.childWorkflowRunId;
+    if (!childRunId) {
+      throw new Error("Expected workflow attempt child workflow run id");
+    }
+    expect(
+      await backend.getWorkflowRun({ workflowRunId: childRunId }),
+    ).toMatchObject({ status: "pending", attempts: 0, concurrencyKey });
+
+    await holderHandle.cancel();
     const childStatus = await tickUntilStatus(
       backend,
       worker,
@@ -4776,6 +4918,7 @@ function createMockWorkflowRun(
     version: null,
     status: "running",
     idempotencyKey: null,
+    concurrencyKey: null,
     config: {},
     context: null,
     input: null,

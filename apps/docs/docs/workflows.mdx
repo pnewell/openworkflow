@@ -220,6 +220,34 @@ const handle = await ow.runWorkflow(
 );
 ```
 
+### Concurrency Key (Optional)
+
+Runs that share a concurrency key run one at a time:
+
+```ts
+const handle = await ow.runWorkflow(
+  syncAccount.spec,
+  { accountId: "acct_123" },
+  { concurrencyKey: "account:acct_123" },
+);
+```
+
+Within a given namespace, runs of any workflow with the same `concurrencyKey`
+share it. A run holds the key from the moment a worker first claims it until it
+completes, fails, or is canceled, including while it sleeps, waits, and retries.
+Other runs with that key wait for it and start one at a time, in the order they
+became due and then the order they were created. A run scheduled for later is
+not in line until it is due. An empty key throws an error.
+
+Canceling a run, or its deadline passing, frees its key immediately. A step the
+run's worker is still executing is not stopped, so it can still be running when
+the next run with that key starts.
+
+<Note>
+  Upgrade every worker before relying on concurrency keys. Workers on an older
+  version start runs without checking their key.
+</Note>
+
 ## Workflow Function Parameters
 
 The workflow function receives an object with four properties:

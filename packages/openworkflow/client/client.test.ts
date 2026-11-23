@@ -585,6 +585,36 @@ describe("OpenWorkflow", () => {
     expect(handle.workflowRun.idempotencyKey).toBe(key);
   });
 
+  test("creates workflow run with concurrency key", async () => {
+    const backend = await createTestBackend();
+    const client = new OpenWorkflow({ backend });
+
+    const workflow = client.defineWorkflow(
+      { name: "concurrency-key-test" },
+      noopFn,
+    );
+    const key = randomUUID();
+    const handle = await workflow.run({ value: 1 }, { concurrencyKey: key });
+    const withoutKey = await workflow.run({ value: 1 });
+
+    expect(handle.workflowRun.concurrencyKey).toBe(key);
+    expect(withoutKey.workflowRun.concurrencyKey).toBeNull();
+  });
+
+  test("throws for an empty concurrency key", async () => {
+    const backend = await createTestBackend();
+    const client = new OpenWorkflow({ backend });
+
+    const workflow = client.defineWorkflow(
+      { name: "concurrency-key-empty-test" },
+      noopFn,
+    );
+
+    await expect(
+      workflow.run({ value: 1 }, { concurrencyKey: "" }),
+    ).rejects.toThrow("A concurrency key must be a nonempty string");
+  });
+
   test("reuses existing workflow run for same idempotency key", async () => {
     const backend = await createTestBackend();
     const client = new OpenWorkflow({ backend });
@@ -909,6 +939,7 @@ function createMockWorkflowRun(
     version: null,
     status: "pending",
     idempotencyKey: null,
+    concurrencyKey: null,
     config: {},
     context: null,
     input: null,

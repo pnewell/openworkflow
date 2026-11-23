@@ -12,7 +12,8 @@ interface PreparedWorkflowRerun {
 }
 
 /**
- * Validate a rerun and reuse the source input, version, and configuration.
+ * Validate a rerun and reuse the source input, version, configuration, and
+ * concurrency key.
  * @param source - Source run, read within the copying transaction
  * @param request - Rerun request
  * @param steps - Source attempt metadata, read in the same transaction
@@ -73,6 +74,7 @@ export function prepareWorkflowRerun(
       config: source.config,
       context,
       idempotencyKey: null,
+      concurrencyKey: source.concurrencyKey,
       parentStepAttemptNamespaceId: null,
       parentStepAttemptId: null,
       availableAt: null,

@@ -88,6 +88,30 @@ await step.runWorkflow(w.spec, undefined, {
   keeps running independently. The child is not automatically canceled.
 </Warning>
 
+## Concurrency Key
+
+Set `options.concurrencyKey` to give the child run a
+[concurrency key](/docs/workflows#concurrency-key-optional):
+
+```ts
+const result = await step.runWorkflow(
+  syncAccountWorkflow.spec,
+  { accountId: input.accountId },
+  { concurrencyKey: `account:${input.accountId}` },
+);
+```
+
+The child takes its turn like any other run with that key, and the time it
+spends waiting for the key counts toward `options.timeout`.
+
+<Warning>
+  A run keeps its own concurrency key while it waits on a child. A child that
+  asks for the key its parent holds is refused with an error, since it could
+  never start. Only the direct parent is checked: a longer chain of waits that
+  comes back to a key one of its runs holds cannot start until a child call's
+  timeout passes.
+</Warning>
+
 ## Workflow Spec
 
 The first argument accepts a workflow spec:

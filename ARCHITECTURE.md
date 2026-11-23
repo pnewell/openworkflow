@@ -149,7 +149,9 @@ of coordination. There is no separate orchestrator server.
     status is either `pending` (new work), `running` (parked or with an expired
     lease), or legacy `sleeping`. It uses an atomic `FOR UPDATE SKIP LOCKED`
     query to claim a single workflow run, setting its status to `running` and
-    extending the lease.
+    extending the lease. A run with a concurrency key that has not been claimed
+    yet is passed over while another run holds its key or is ahead of it in
+    line.
 4.  **Code Execution (Replay Loop)**: The Worker loads the history of completed
     `step_attempts` for the claimed workflow. It then executes the workflow code
     from the beginning, using the history to memoize results of

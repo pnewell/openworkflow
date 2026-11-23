@@ -2,6 +2,7 @@ import type { StandardSchemaV1 } from "./standard-schema.js";
 import {
   isTerminalStatus,
   resolveCancelWorkflowRunConflict,
+  validateConcurrencyKey,
   validateInput,
 } from "./workflow-run.js";
 import type { WorkflowRun, WorkflowRunStatus } from "./workflow-run.js";
@@ -168,6 +169,7 @@ describe("resolveCancelWorkflowRunConflict", () => {
       version: null,
       status,
       idempotencyKey: null,
+      concurrencyKey: null,
       config: {},
       context: null,
       input: null,
@@ -227,3 +229,20 @@ function createMockSchema<I, O = I>(options: {
     },
   };
 }
+
+describe("validateConcurrencyKey", () => {
+  test("accepts a nonempty key or no key", () => {
+    expect(() => {
+      validateConcurrencyKey("account:123");
+    }).not.toThrow();
+    expect(() => {
+      validateConcurrencyKey();
+    }).not.toThrow();
+  });
+
+  test("throws for an empty key", () => {
+    expect(() => {
+      validateConcurrencyKey("");
+    }).toThrow("A concurrency key must be a nonempty string");
+  });
+});

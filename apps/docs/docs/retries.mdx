@@ -40,9 +40,9 @@ const newRun = await ow.rerunWorkflowRun(originalRunId, {
 });
 ```
 
-The new run uses the original input and workflow version. It is ready to run
-immediately, with fresh retry counts and no deadline, idempotency key, or parent
-run. The source run stays unchanged.
+The new run uses the original input, workflow version, and concurrency key. It
+is ready to run immediately, with fresh retry counts and no deadline,
+idempotency key, or parent run. The source run stays unchanged.
 
 With `fromStep`, OpenWorkflow copies successful steps from before the selected
 step. The new run reuses those results.

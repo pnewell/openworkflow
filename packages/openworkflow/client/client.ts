@@ -28,7 +28,7 @@ import type {
   SchemaOutput,
   WorkflowRun,
 } from "../core/workflow-run.js";
-import { validateInput } from "../core/workflow-run.js";
+import { validateConcurrencyKey, validateInput } from "../core/workflow-run.js";
 import {
   ATTRIBUTE_NAMES,
   getSpanKind,
@@ -169,12 +169,14 @@ export class OpenWorkflow {
         const idempotencyPeriodMs = resolveIdempotencyPeriodMs(
           options?.idempotencyPeriod,
         );
+        validateConcurrencyKey(options?.concurrencyKey);
 
         const workflowRun = await this.backend.createWorkflowRun({
           workflowName: spec.name,
           version: spec.version ?? null,
           idempotencyKey: options?.idempotencyKey ?? null,
           idempotencyPeriodMs,
+          concurrencyKey: options?.concurrencyKey ?? null,
           config: {},
           context: captureTraceContext(),
           input: parsedInput ?? null,
@@ -424,6 +426,12 @@ export interface WorkflowRunOptions {
    * @default 86400000 (24 hours)
    */
   idempotencyPeriod?: number | DurationString;
+  /**
+   * Run one workflow run at a time among the runs in the namespace that share
+   * this key. A run holds the key from when it first starts until it
+   * completes, fails, or is canceled.
+   */
+  concurrencyKey?: string;
 }
 
 /**

@@ -481,6 +481,84 @@ describe("BackendPostgres step-attempt lease fencing", () => {
   );
 });
 
+describe("BackendPostgres concurrency key advisory locks", () => {
+  test("claims nothing when a run due earlier is added while the claim waits for the key's lock", async () => {
+    const namespaceId = randomUUID();
+    const concurrencyKey = randomUUID();
+    const backendPool = newPostgresMaxOne(DEFAULT_POSTGRES_URL);
+    const lockPool = newPostgresMaxOne(DEFAULT_POSTGRES_URL);
+    const observerPool = newPostgresMaxOne(DEFAULT_POSTGRES_URL);
+    const backend = BackendPostgres.fromPool(backendPool, { namespaceId });
+    const observer = BackendPostgres.fromPool(observerPool, { namespaceId });
+    const lock = await lockPool.reserve();
+    let lockOpen = false;
+    let claim: Promise<unknown> | undefined;
+
+    try {
+      const createParams = {
+        workflowName: randomUUID(),
+        version: null,
+        idempotencyKey: null,
+        concurrencyKey,
+        input: null,
+        config: {},
+        context: null,
+        parentStepAttemptNamespaceId: null,
+        parentStepAttemptId: null,
+        availableAt: null,
+        deadlineAt: null,
+      };
+      await backend.createWorkflowRun(createParams);
+      const [backendConnection] = await backendPool<{ pid: number }[]>`
+        SELECT pg_backend_pid() AS "pid"
+      `;
+      if (!backendConnection) {
+        throw new Error("Expected Postgres backend connection pid");
+      }
+
+      await lock.unsafe("BEGIN");
+      lockOpen = true;
+      await lock.unsafe(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0::bigint))",
+        [JSON.stringify({ namespaceId, concurrencyKey })],
+      );
+
+      const claimPromise = backend.claimWorkflowRun({
+        workerId: randomUUID(),
+        leaseDurationMs: 60_000,
+      });
+      claim = claimPromise;
+
+      await waitForPostgresBackendLock(observerPool, backendConnection.pid);
+      const earlier = await observer.createWorkflowRun({
+        ...createParams,
+        availableAt: new Date(Date.now() - 60_000),
+      });
+      await lock.unsafe("COMMIT");
+      lockOpen = false;
+
+      await expect(claimPromise).resolves.toBeNull();
+
+      const next = await backend.claimWorkflowRun({
+        workerId: randomUUID(),
+        leaseDurationMs: 60_000,
+      });
+      expect(next?.id).toBe(earlier.id);
+    } finally {
+      if (lockOpen) {
+        await lock.unsafe("ROLLBACK");
+      }
+      await claim?.catch(() => null);
+      lock.release();
+      await Promise.all([
+        backendPool.end(),
+        lockPool.end(),
+        observerPool.end(),
+      ]);
+    }
+  });
+});
+
 describe("BackendPostgres schema option", () => {
   test("stores workflow data in the configured schema", async () => {
     const schema = `test_schema_${randomUUID().replaceAll("-", "_")}`;

@@ -109,6 +109,7 @@ export interface CreateWorkflowRunParams {
   version: string | null;
   idempotencyKey: string | null;
   idempotencyPeriodMs?: number; // omitted = 24 hours, 0 = no limit
+  concurrencyKey?: string | null; // omitted or null = no key
   config: JsonValue;
   context: JsonValue | null;
   input: JsonValue | null;

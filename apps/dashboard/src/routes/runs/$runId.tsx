@@ -546,6 +546,17 @@ function RunOverviewPanel({
             />
           </div>
         )}
+        {run.concurrencyKey !== null && (
+          <div className="flex min-w-0 flex-wrap items-center gap-2">
+            <span className="text-muted-foreground shrink-0 text-xs">
+              Concurrency Key
+            </span>
+            <IdentifierValue
+              value={run.concurrencyKey}
+              className="whitespace-pre-wrap"
+            />
+          </div>
+        )}
         <div className="flex min-w-0 flex-wrap items-center gap-2">
           <span className="text-muted-foreground shrink-0 text-xs">Status</span>
           <Tooltip>

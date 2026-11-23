@@ -72,6 +72,7 @@ const workflowRunColumns = [
   "version",
   "status",
   "idempotency_key",
+  "concurrency_key",
   "config",
   "context",
   "input",
@@ -446,6 +447,7 @@ export class BackendPostgres implements Backend {
         "version",
         "status",
         "idempotency_key",
+        "concurrency_key",
         "config",
         "context",
         "input",
@@ -464,6 +466,7 @@ export class BackendPostgres implements Backend {
         ${params.version},
         'pending',
         ${params.idempotencyKey},
+        ${params.concurrencyKey ?? null},
         ${pg.json(params.config)},
         ${pg.json(params.context)},
         ${pg.json(params.input)},
@@ -690,17 +693,54 @@ export class BackendPostgres implements Backend {
   async claimWorkflowRun(
     params: ClaimWorkflowRunParams,
   ): Promise<WorkflowRun | null> {
+    const picked = await this.claimNextWorkflowRun(this.pg, params, null);
+    if (!picked || picked.attempts > 0) {
+      return picked ?? null;
+    }
+
+    // a keyed run that has not been claimed yet is claimed under its key's lock
+    const lockScope = JSON.stringify({
+      namespaceId: this.namespaceId,
+      concurrencyKey: picked.concurrencyKey,
+    });
+
+    return await this.withTransaction(async (tx) => {
+      await tx.unsafe(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0::bigint))",
+        [lockScope],
+      );
+
+      const claimed = await this.claimNextWorkflowRun(tx, params, picked.id);
+      return claimed ?? null;
+    });
+  }
+
+  /**
+   * Claim the next available workflow run. A run with a concurrency key that
+   * has not been claimed yet is passed over while another run holds its key or
+   * is ahead of it in line, and is returned unclaimed unless it is the run
+   * being claimed under its key's lock.
+   * @param pg - Postgres client or transaction
+   * @param params - Claim params
+   * @param lockedWorkflowRunId - Unclaimed run whose key lock is held, if any
+   * @returns The claimed run, or the unclaimed run that needs its key's lock
+   */
+  private async claimNextWorkflowRun(
+    pg: Postgres,
+    params: ClaimWorkflowRunParams,
+    lockedWorkflowRunId: string | null,
+  ): Promise<WorkflowRun | undefined> {
     // 1. mark any deadline-expired workflow runs as failed
     // 2. find an available workflow run to claim
     // 3. claim the workflow run
-    const workflowRunsTable = this.workflowRunsTable();
+    const workflowRunsTable = this.workflowRunsTable(pg);
 
-    const [claimed] = await this.pg<WorkflowRun[]>`
+    const [workflowRun] = await pg<WorkflowRun[]>`
       WITH expired AS (
         UPDATE ${workflowRunsTable}
         SET
           "status" = 'failed',
-          "error" = ${this.pg.json({ message: "Workflow run deadline exceeded" })},
+          "error" = ${pg.json({ message: "Workflow run deadline exceeded" })},
           "worker_id" = NULL,
           "available_at" = NULL,
           "finished_at" = NOW(),
@@ -712,34 +752,75 @@ export class BackendPostgres implements Backend {
         RETURNING "id"
       ),
       candidate AS (
-        SELECT "id"
-        FROM ${workflowRunsTable}
+        SELECT ${pg(workflowRunColumns)}
+        FROM ${workflowRunsTable} AS c
         WHERE "namespace_id" = ${this.namespaceId}
           AND "status" IN ('pending', 'running', 'sleeping')
           AND "available_at" <= NOW()
           AND ("deadline_at" IS NULL OR "deadline_at" > NOW())
+          AND ${
+            lockedWorkflowRunId === null
+              ? pg`TRUE`
+              : pg`"id" = ${lockedWorkflowRunId} AND "attempts" = 0`
+          }
+          AND (
+            "concurrency_key" IS NULL
+            OR "attempts" > 0
+            OR (
+              NOT EXISTS (
+                SELECT 1
+                FROM ${workflowRunsTable} AS holder
+                WHERE holder."namespace_id" = c."namespace_id"
+                  AND holder."concurrency_key" = c."concurrency_key"
+                  AND holder."status" IN ('pending', 'running', 'sleeping')
+                  AND holder."attempts" > 0
+                  AND (holder."deadline_at" IS NULL OR holder."deadline_at" > NOW())
+              )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM ${workflowRunsTable} AS ahead
+                WHERE ahead."namespace_id" = c."namespace_id"
+                  AND ahead."concurrency_key" = c."concurrency_key"
+                  AND ahead."status" IN ('pending', 'running', 'sleeping')
+                  AND ahead."attempts" = 0
+                  AND (ahead."deadline_at" IS NULL OR ahead."deadline_at" > NOW())
+                  AND (ahead."available_at", ahead."created_at", ahead."id")
+                    < (c."available_at", c."created_at", c."id")
+              )
+            )
+          )
         ORDER BY
           CASE WHEN "status" = 'pending' THEN 0 ELSE 1 END,
           "available_at",
           "created_at"
         LIMIT 1
         FOR UPDATE SKIP LOCKED
+      ),
+      claimed AS (
+        UPDATE ${workflowRunsTable} AS wr
+        SET
+          "status" = 'running',
+          "attempts" = wr."attempts" + 1,
+          "worker_id" = ${params.workerId},
+          "available_at" = NOW() + ${params.leaseDurationMs} * INTERVAL '1 millisecond',
+          "started_at" = COALESCE(wr."started_at", NOW()),
+          "updated_at" = NOW()
+        FROM candidate
+        WHERE wr."id" = candidate."id"
+          AND wr."namespace_id" = ${this.namespaceId}
+          AND (
+            candidate."concurrency_key" IS NULL
+            OR candidate."attempts" > 0
+            OR candidate."id" = ${lockedWorkflowRunId}
+          )
+        RETURNING ${pg(workflowRunColumns.map((column) => `wr.${column}`))}
       )
-      UPDATE ${workflowRunsTable} AS wr
-      SET
-        "status" = 'running',
-        "attempts" = "attempts" + 1,
-        "worker_id" = ${params.workerId},
-        "available_at" = NOW() + ${params.leaseDurationMs} * INTERVAL '1 millisecond',
-        "started_at" = COALESCE("started_at", NOW()),
-        "updated_at" = NOW()
-      FROM candidate
-      WHERE wr."id" = candidate."id"
-        AND wr."namespace_id" = ${this.namespaceId}
-      RETURNING ${this.pg(workflowRunColumns.map((column) => `wr.${column}`))};
+      SELECT * FROM claimed
+      UNION ALL
+      SELECT * FROM candidate WHERE NOT EXISTS (SELECT 1 FROM claimed);
     `;
 
-    return claimed ?? null;
+    return workflowRun;
   }
 
   async extendWorkflowRunLease(

@@ -2,6 +2,7 @@ import { OpenWorkflow } from "../client/client.js";
 import {
   DEFAULT_RUN_IDEMPOTENCY_PERIOD_MS,
   type Backend,
+  type CreateWorkflowRunParams,
 } from "../core/backend.js";
 import type { StepAttempt } from "../core/step-attempt.js";
 import { DEFAULT_WORKFLOW_RETRY_POLICY } from "../core/workflow-definition.js";
@@ -57,6 +58,7 @@ export function testBackend(options: TestBackendOptions): void {
           version: randomUUID(),
           status: "pending",
           idempotencyKey: randomUUID(),
+          concurrencyKey: randomUUID(),
           config: { key: "val" },
           context: { key: "val" },
           input: { key: "val" },
@@ -79,6 +81,7 @@ export function testBackend(options: TestBackendOptions): void {
           workflowName: expected.workflowName,
           version: expected.version,
           idempotencyKey: expected.idempotencyKey,
+          concurrencyKey: expected.concurrencyKey,
           input: expected.input,
           config: expected.config,
           context: expected.context,
@@ -115,6 +118,7 @@ export function testBackend(options: TestBackendOptions): void {
         });
         expect(createdMin.version).toBeNull();
         expect(createdMin.idempotencyKey).toBeNull();
+        expect(createdMin.concurrencyKey).toBeNull();
         expect(createdMin.input).toBeNull();
         expect(createdMin.context).toBeNull();
         expect(deltaSeconds(createdMin.availableAt)).toBeLessThan(1); // defaults to NOW()
@@ -1196,6 +1200,199 @@ export function testBackend(options: TestBackendOptions): void {
           leaseDurationMs: 10,
         });
         expect(claimed).toBeNull();
+
+        await teardown(backend);
+      });
+
+      test(
+        "claims workflow runs sharing a concurrency key one at a time in line order",
+        { timeout: 15_000 },
+        async () => {
+          const backend = await setup();
+          const concurrencyKey = randomUUID();
+          const dueAt = Date.now() - 60_000;
+
+          const line: string[] = [];
+          for (let i = 0; i < 4; i++) {
+            const run = await createPendingWorkflowRun(backend, {
+              concurrencyKey,
+              availableAt: new Date(dueAt),
+            });
+            line.push(run.id);
+          }
+          // a key with a single run waiting
+          const single = await createPendingWorkflowRun(backend, {
+            concurrencyKey: randomUUID(),
+          });
+
+          const started: string[] = [];
+          let singleClaims = 0;
+          let holder: WorkflowRun | undefined;
+          for (let round = 0; round < 20 && started.length < 4; round++) {
+            const claims = await Promise.all(
+              Array.from({ length: 5 }, () =>
+                backend.claimWorkflowRun({
+                  workerId: randomUUID(),
+                  leaseDurationMs: 60_000,
+                }),
+              ),
+            );
+            const claimed = claims.filter((run) => run !== null);
+            singleClaims += claimed.filter(
+              (run) => run.id === single.id,
+            ).length;
+            const keyed = claimed.filter(
+              (run) => run.concurrencyKey === concurrencyKey,
+            );
+
+            if (holder) {
+              // nothing starts while another run holds the key
+              expect(keyed).toHaveLength(0);
+              await backend.completeWorkflowRun({
+                workflowRunId: holder.id,
+                workerId: holder.workerId!, // oxlint-disable-line typescript/no-non-null-assertion
+                output: null,
+              });
+              holder = undefined;
+            } else {
+              expect(keyed).toHaveLength(1);
+              holder = keyed[0];
+              started.push(...keyed.map((run) => run.id));
+            }
+          }
+
+          expect(started).toEqual(line);
+          expect(singleClaims).toBe(1);
+
+          await teardown(backend);
+        },
+      );
+
+      test("reclaims a parked run that holds its concurrency key while other runs wait in line", async () => {
+        const backend = await setup();
+        const concurrencyKey = randomUUID();
+
+        const first = await createPendingWorkflowRun(backend, {
+          concurrencyKey,
+          availableAt: new Date(Date.now() - 1000),
+        });
+        await createPendingWorkflowRun(backend, { concurrencyKey });
+
+        const workerId = randomUUID();
+        const claimed = await backend.claimWorkflowRun({
+          workerId,
+          leaseDurationMs: 60_000,
+        });
+        expect(claimed?.id).toBe(first.id);
+
+        const parked = await backend.sleepWorkflowRun({
+          workflowRunId: first.id,
+          workerId,
+          availableAt: new Date(Date.now() + 50),
+        });
+        expect(
+          await backend.claimWorkflowRun({
+            workerId: randomUUID(),
+            leaseDurationMs: 60_000,
+          }),
+        ).toBeNull();
+
+        await sleepUntilAfter(parked.availableAt);
+
+        const reclaimed = await backend.claimWorkflowRun({
+          workerId: randomUUID(),
+          leaseDurationMs: 60_000,
+        });
+        expect(reclaimed?.id).toBe(first.id);
+        expect(reclaimed?.attempts).toBe(2);
+        expect(
+          await backend.claimWorkflowRun({
+            workerId: randomUUID(),
+            leaseDurationMs: 60_000,
+          }),
+        ).toBeNull();
+
+        await teardown(backend);
+      });
+
+      test("does not hold up other workflow runs while a run waits for its concurrency key", async () => {
+        const backend = await setup();
+        const concurrencyKey = randomUUID();
+
+        const holder = await createPendingWorkflowRun(backend, {
+          concurrencyKey,
+          availableAt: new Date(Date.now() - 2000),
+        });
+        // not in line until it is due
+        await createPendingWorkflowRun(backend, {
+          concurrencyKey,
+          availableAt: newDateInOneYear(),
+        });
+        const waiting = await createPendingWorkflowRun(backend, {
+          concurrencyKey,
+          availableAt: new Date(Date.now() - 1000),
+        });
+        const otherKey = await createPendingWorkflowRun(backend, {
+          concurrencyKey: randomUUID(),
+          availableAt: new Date(Date.now() - 500),
+        });
+        const noKey = await createPendingWorkflowRun(backend);
+
+        const claimedIds: (string | undefined)[] = [];
+        for (let i = 0; i < 4; i++) {
+          const claimed = await backend.claimWorkflowRun({
+            workerId: "worker",
+            leaseDurationMs: 60_000,
+          });
+          claimedIds.push(claimed?.id);
+        }
+        expect(claimedIds).toEqual([
+          holder.id,
+          otherKey.id,
+          noKey.id,
+          undefined,
+        ]);
+
+        await backend.failWorkflowRun({
+          workflowRunId: holder.id,
+          workerId: "worker",
+          error: { message: "failed run" },
+          retryPolicy: { ...DEFAULT_WORKFLOW_RETRY_POLICY, maximumAttempts: 1 },
+        });
+        const next = await backend.claimWorkflowRun({
+          workerId: "worker",
+          leaseDurationMs: 60_000,
+        });
+        expect(next?.id).toBe(waiting.id);
+
+        await teardown(backend);
+      });
+
+      test("frees the concurrency key when its holder is canceled", async () => {
+        const backend = await setup();
+        const concurrencyKey = randomUUID();
+
+        const holder = await createPendingWorkflowRun(backend, {
+          concurrencyKey,
+          availableAt: new Date(Date.now() - 1000),
+        });
+        const waiting = await createPendingWorkflowRun(backend, {
+          concurrencyKey,
+        });
+
+        const claimed = await backend.claimWorkflowRun({
+          workerId: randomUUID(),
+          leaseDurationMs: 60_000,
+        });
+        expect(claimed?.id).toBe(holder.id);
+
+        await backend.cancelWorkflowRun({ workflowRunId: holder.id });
+
+        const next = await backend.claimWorkflowRun({
+          workerId: randomUUID(),
+          leaseDurationMs: 60_000,
+        });
+        expect(next?.id).toBe(waiting.id);
 
         await teardown(backend);
       });
@@ -2344,6 +2541,43 @@ export function testBackend(options: TestBackendOptions): void {
         await teardown(backend);
       });
 
+      test("frees the concurrency key in the claim that fails runs past their deadline", async () => {
+        const backend = await setup();
+        const concurrencyKey = randomUUID();
+
+        const holder = await createPendingWorkflowRun(backend, {
+          concurrencyKey,
+          availableAt: new Date(Date.now() - 3000),
+          deadlineAt: new Date(Date.now() + 100),
+        });
+        const claimed = await backend.claimWorkflowRun({
+          workerId: randomUUID(),
+          leaseDurationMs: 60_000,
+        });
+        expect(claimed?.id).toBe(holder.id);
+
+        // ahead in line, but past its deadline before it is claimed
+        const expired = await createPendingWorkflowRun(backend, {
+          concurrencyKey,
+          availableAt: new Date(Date.now() - 2000),
+          deadlineAt: new Date(Date.now() + 100),
+        });
+        const waiting = await createPendingWorkflowRun(backend, {
+          concurrencyKey,
+        });
+
+        await sleepUntilAfter(holder.deadlineAt);
+        await sleepUntilAfter(expired.deadlineAt);
+
+        const next = await backend.claimWorkflowRun({
+          workerId: randomUUID(),
+          leaseDurationMs: 60_000,
+        });
+        expect(next?.id).toBe(waiting.id);
+
+        await teardown(backend);
+      });
+
       test("marks deadline-expired workflow runs as failed when claiming", async () => {
         const backend = await setup();
 
@@ -3022,9 +3256,13 @@ export function testBackend(options: TestBackendOptions): void {
 /**
  * Create a pending workflow run for tests.
  * @param b - Backend
+ * @param overrides - Run params to override
  * @returns Created workflow run
  */
-async function createPendingWorkflowRun(b: Backend) {
+async function createPendingWorkflowRun(
+  b: Backend,
+  overrides: Partial<CreateWorkflowRunParams> = {},
+) {
   return await b.createWorkflowRun({
     workflowName: randomUUID(),
     version: null,
@@ -3036,6 +3274,7 @@ async function createPendingWorkflowRun(b: Backend) {
     parentStepAttemptId: null,
     availableAt: null,
     deadlineAt: null,
+    ...overrides,
   });
 }
 

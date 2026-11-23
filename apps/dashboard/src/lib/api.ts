@@ -150,6 +150,7 @@ export const createWorkflowRunServerFn = createServerFn({ method: "POST" })
       version: z.string().nullable().optional(),
       input: z.string().nullable().optional(),
       idempotencyKey: z.string().nullable().optional(),
+      concurrencyKey: z.string().nullable().optional(),
       availableAt: z.string().nullable().optional(),
       deadlineAt: z.string().nullable().optional(),
     }),
@@ -169,6 +170,8 @@ export const createWorkflowRunServerFn = createServerFn({ method: "POST" })
       version,
       idempotencyKey:
         data.idempotencyKey === "" ? null : (data.idempotencyKey ?? null),
+      concurrencyKey:
+        data.concurrencyKey === "" ? null : (data.concurrencyKey ?? null),
       config: {},
       context: null,
       input: parseWorkflowInput(data.input),

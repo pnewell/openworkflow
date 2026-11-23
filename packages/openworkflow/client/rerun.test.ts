@@ -78,7 +78,7 @@ describe.each(["sqlite", "postgres"])("reruns (%s)", (database) => {
     );
     const original = await workflow.run(
       { value: 42 },
-      { idempotencyKey: "request" },
+      { idempotencyKey: "request", concurrencyKey: "account" },
     );
     const source = await finish(original.workflowRun.id);
     expect(source.status).toBe("failed");
@@ -96,6 +96,7 @@ describe.each(["sqlite", "postgres"])("reruns (%s)", (database) => {
       error: null,
       context: null,
       idempotencyKey: null,
+      concurrencyKey: "account",
       deadlineAt: null,
       parentStepAttemptNamespaceId: null,
       parentStepAttemptId: null,

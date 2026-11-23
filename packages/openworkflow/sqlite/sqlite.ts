@@ -238,6 +238,16 @@ export function migrations(): string[] {
     CREATE INDEX "workflow_schedules_created_at_idx"
       ON "workflow_schedules" ("namespace_id", "created_at", "id");
     INSERT INTO "openworkflow_migrations" ("version") VALUES (7);`,
+
+    // 8 - concurrency keys
+    `ALTER TABLE "workflow_runs" ADD COLUMN "concurrency_key" TEXT;
+
+    CREATE INDEX "workflow_runs_concurrency_key_idx"
+    ON "workflow_runs" ("namespace_id", "concurrency_key", "attempts", "available_at", "created_at", "id")
+    WHERE "concurrency_key" IS NOT NULL AND "status" IN ('pending', 'running', 'sleeping');
+
+    INSERT OR IGNORE INTO "openworkflow_migrations" ("version")
+    VALUES (8);`,
   ];
 }
 
