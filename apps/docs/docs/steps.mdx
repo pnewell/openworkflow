@@ -115,7 +115,7 @@ await step.run({ name: "log-event" }, async () => {
 
 ## Step Types
 
-OpenWorkflow provides five step types:
+OpenWorkflow provides six step types:
 
 ### `step.run()`
 
@@ -148,9 +148,21 @@ const childOutput = await step.runWorkflow(
 );
 ```
 
+### `step.startWorkflow()`
+
+Starts another workflow run and returns its ID without waiting for it. See
+[Child Workflows](/docs/child-workflows#starting-without-waiting) for details:
+
+```ts
+const { workflowRunId } = await step.startWorkflow(sendReceiptWorkflow.spec, {
+  orderId: input.orderId,
+});
+```
+
 ### `step.sendSignal()`
 
-Sends a signal to all workflows currently waiting on that signal name:
+Sends a signal to all workflows currently waiting on that signal name, or to
+one workflow run when `workflowRunId` is given:
 
 ```ts
 const { workflowRunIds } = await step.sendSignal({
@@ -212,8 +224,20 @@ await step.run({ name: "risky-operation" }, async () => {
 });
 ```
 
-Steps that throw are marked as failed. The workflow can be retried, and failed
-steps will re-execute (not return cached results).
+Steps that throw are marked as failed. While a step has
+[retries](/docs/retries) left, a failure ends the execution and the step
+re-executes when the workflow resumes. Once the step has failed for good, its
+error is thrown into the workflow and saved like a result: on replay the step
+is not run again and the saved error is thrown again.
+
+A `try/catch` around a step does not stop the step's retries. The `catch` runs
+only after the step's final failure, and a `finally` around a step runs only
+once the step has succeeded or failed for good.
+
+A `try/catch` around `step.sleep()`, `step.runWorkflow()`, or
+`step.waitForSignal()` cannot catch the pause while the workflow waits, and a
+`finally` around the wait does not run on an execution that pauses there. Both
+see the wait's result or error once it finishes.
 
 Each workflow run also has a hard cap of 1000 total step attempts. If that
 limit is reached, the run fails and does not retry.

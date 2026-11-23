@@ -585,6 +585,36 @@ describe("OpenWorkflow", () => {
     expect(handle.workflowRun.idempotencyKey).toBe(key);
   });
 
+  test("creates workflow run with concurrency key", async () => {
+    const backend = await createTestBackend();
+    const client = new OpenWorkflow({ backend });
+
+    const workflow = client.defineWorkflow(
+      { name: "concurrency-key-test" },
+      noopFn,
+    );
+    const key = randomUUID();
+    const handle = await workflow.run({ value: 1 }, { concurrencyKey: key });
+    const withoutKey = await workflow.run({ value: 1 });
+
+    expect(handle.workflowRun.concurrencyKey).toBe(key);
+    expect(withoutKey.workflowRun.concurrencyKey).toBeNull();
+  });
+
+  test("throws for an empty concurrency key", async () => {
+    const backend = await createTestBackend();
+    const client = new OpenWorkflow({ backend });
+
+    const workflow = client.defineWorkflow(
+      { name: "concurrency-key-empty-test" },
+      noopFn,
+    );
+
+    await expect(
+      workflow.run({ value: 1 }, { concurrencyKey: "" }),
+    ).rejects.toThrow("A concurrency key must be a nonempty string");
+  });
+
   test("reuses existing workflow run for same idempotency key", async () => {
     const backend = await createTestBackend();
     const client = new OpenWorkflow({ backend });
@@ -631,6 +661,80 @@ describe("OpenWorkflow", () => {
 
     const second = await workflow.run({ value: 2 }, { idempotencyKey: key });
     expect(second.workflowRun.id).not.toBe(first.workflowRun.id);
+  });
+
+  test("honors a custom idempotencyPeriod", async () => {
+    const backend = await createTestBackend();
+    const client = new OpenWorkflow({ backend });
+    const workflow = client.defineWorkflow(
+      { name: "idempotency-period-test" },
+      noopFn,
+    );
+    const key = randomUUID();
+
+    const first = await workflow.run({ value: 1 }, { idempotencyKey: key });
+
+    const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    const pg = newPostgresMaxOne(DEFAULT_POSTGRES_URL);
+    try {
+      const workflowRunsTable = pg`${pg(DEFAULT_SCHEMA)}.${pg("workflow_runs")}`;
+      await pg`
+        UPDATE ${workflowRunsTable}
+        SET "created_at" = ${twoHoursAgo}
+        WHERE "namespace_id" = ${first.workflowRun.namespaceId}
+          AND "id" = ${first.workflowRun.id}
+      `;
+    } finally {
+      await pg.end();
+    }
+
+    const withinPeriod = await workflow.run(
+      { value: 2 },
+      { idempotencyKey: key, idempotencyPeriod: "3h" },
+    );
+    expect(withinPeriod.workflowRun.id).toBe(first.workflowRun.id);
+
+    const noLimit = await workflow.run(
+      { value: 2 },
+      { idempotencyKey: key, idempotencyPeriod: 0 },
+    );
+    expect(noLimit.workflowRun.id).toBe(first.workflowRun.id);
+
+    const afterPeriod = await workflow.run(
+      { value: 2 },
+      { idempotencyKey: key, idempotencyPeriod: 60 * 60 * 1000 },
+    );
+    expect(afterPeriod.workflowRun.id).not.toBe(first.workflowRun.id);
+  });
+
+  test("throws for invalid idempotencyPeriod", async () => {
+    const backend = await createTestBackend();
+    const client = new OpenWorkflow({ backend });
+    const workflow = client.defineWorkflow(
+      { name: "idempotency-period-invalid-test" },
+      noopFn,
+    );
+    const key = randomUUID();
+
+    await expect(
+      workflow.run(
+        { value: 1 },
+        { idempotencyKey: key, idempotencyPeriod: -1 },
+      ),
+    ).rejects.toThrow("Idempotency period must be a non-negative number");
+    await expect(
+      workflow.run(
+        { value: 1 },
+        { idempotencyKey: key, idempotencyPeriod: Number.POSITIVE_INFINITY },
+      ),
+    ).rejects.toThrow("Idempotency period must be a non-negative number");
+    await expect(
+      workflow.run(
+        { value: 1 },
+        // @ts-expect-error - invalid duration format
+        { idempotencyKey: key, idempotencyPeriod: "not-a-duration" },
+      ),
+    ).rejects.toThrow('Invalid duration format: "not-a-duration"');
   });
 
   test("cancels workflow run via handle", async () => {
@@ -835,6 +939,7 @@ function createMockWorkflowRun(
     version: null,
     status: "pending",
     idempotencyKey: null,
+    concurrencyKey: null,
     config: {},
     context: null,
     input: null,

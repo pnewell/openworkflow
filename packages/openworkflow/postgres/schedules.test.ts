@@ -35,6 +35,40 @@ describe("postgres scheduling", () => {
     }
   });
 
+  test("dispatch counts an unfinished run committed while the schedule was locked", async () => {
+    const schema = `schedule_overlap_${randomUUID().replaceAll("-", "")}`;
+    const backend = await BackendPostgres.connect(TEST_POSTGRES_URL, {
+      schema,
+    });
+    const admin = newPostgresMaxOne(TEST_POSTGRES_URL);
+    const ow = new OpenWorkflow({ backend });
+    const dispatch = { before: new Date(Date.now() + 86_400_000), limit: 100 };
+    try {
+      await ow.scheduleWorkflow({ name: "report" }, null, {
+        cron: "0 * * * *",
+        overlap: "skip",
+      });
+      await admin.begin(async (tx) => {
+        await tx`SELECT id FROM ${tx(schema)}."workflow_schedules"
+          WHERE id='report' FOR UPDATE`;
+        await tx`INSERT INTO ${tx(schema)}."workflow_runs"
+          (namespace_id,id,workflow_name,status,config,attempts,
+           workflow_schedule_id,available_at,created_at,updated_at)
+          SELECT namespace_id,gen_random_uuid(),workflow_name,'pending','{}'::jsonb,0,
+            id,now(),now(),now()
+          FROM ${tx(schema)}."workflow_schedules" WHERE id='report'`;
+        expect(await backend.enqueueScheduledRuns(dispatch)).toBe(0);
+      });
+      expect(await backend.enqueueScheduledRuns(dispatch)).toBe(1);
+      const page = await backend.listWorkflowRuns({});
+      expect(page.data).toHaveLength(1);
+    } finally {
+      await backend.stop();
+      await dropSchema(admin, schema);
+      await admin.end();
+    }
+  });
+
   test("schedule dispatch rolls back run insertion and cursor advancement together", async () => {
     const schema = `schedule_atomic_${randomUUID().replaceAll("-", "")}`;
     const backend = await BackendPostgres.connect(TEST_POSTGRES_URL, {

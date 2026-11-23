@@ -96,8 +96,8 @@ export interface Backend {
 
   // Signals
   sendSignal(params: Readonly<SendSignalParams>): Promise<SendSignalResult>;
-  getSignalDelivery(
-    params: Readonly<GetSignalDeliveryParams>,
+  consumeSignal(
+    params: Readonly<ConsumeSignalParams>,
   ): Promise<JsonValue | undefined>;
 
   // Lifecycle
@@ -108,6 +108,8 @@ export interface CreateWorkflowRunParams {
   workflowName: string;
   version: string | null;
   idempotencyKey: string | null;
+  idempotencyPeriodMs?: number; // omitted = 24 hours, 0 = no limit
+  concurrencyKey?: string | null; // omitted or null = no key
   config: JsonValue;
   context: JsonValue | null;
   input: JsonValue | null;
@@ -228,14 +230,18 @@ export interface SendSignalParams {
   signal: string;
   data: JsonValue | null;
   idempotencyKey: string | null;
+  workflowRunId?: string | null; // omitted or null = every waiting run
 }
 
 export interface SendSignalResult {
   workflowRunIds: string[];
 }
 
-export interface GetSignalDeliveryParams {
+export interface ConsumeSignalParams {
+  workflowRunId: string;
   stepAttemptId: string;
+  workerId: string;
+  signal: string;
 }
 
 export interface PaginationOptions {
@@ -250,6 +256,20 @@ export interface PaginatedResponse<T> {
     next: string | null;
     prev: string | null;
   };
+}
+
+/**
+ * Resolve the earliest creation time an existing run can have to be reused
+ * for an idempotency key.
+ * @param idempotencyPeriodMs - Idempotency period in milliseconds (0 = no limit)
+ * @param now - Current time in milliseconds
+ * @returns Earliest creation time that still matches the key
+ */
+export function resolveIdempotencyCutoff(
+  idempotencyPeriodMs: number = DEFAULT_RUN_IDEMPOTENCY_PERIOD_MS,
+  now: number = Date.now(),
+): Date {
+  return new Date(idempotencyPeriodMs === 0 ? 0 : now - idempotencyPeriodMs);
 }
 
 export type WorkflowRunCounts = Omit<

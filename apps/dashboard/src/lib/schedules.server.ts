@@ -8,6 +8,7 @@ export const scheduleInputSchema = z.object({
   workflowName: z.string().trim().min(1),
   cron: z.string().trim().min(1),
   timezone: z.string().trim().min(1),
+  overlap: z.enum(["allow", "skip"]),
   input: z.string(),
   mode: z.enum(["create", "edit"]),
 });
@@ -36,6 +37,11 @@ export async function saveWorkflowSchedule(
   return ow.scheduleWorkflow(
     { name: data.workflowName },
     parseWorkflowInput(data.input),
-    { id: data.id, cron: data.cron, timezone: data.timezone },
+    {
+      id: data.id,
+      cron: data.cron,
+      timezone: data.timezone,
+      overlap: data.overlap,
+    },
   );
 }

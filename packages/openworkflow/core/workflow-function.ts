@@ -44,12 +44,32 @@ export interface StepRunWorkflowOptions {
    * Maximum time to wait for the child workflow to complete.
    */
   timeout?: StepWaitTimeout;
+  /**
+   * Concurrency key for the child workflow run. Cannot be the key held by
+   * the run that calls the step.
+   */
+  concurrencyKey?: string;
+}
+
+/**
+ * Options for an individual step defined with `step.startWorkflow()`.
+ */
+export interface StepStartWorkflowOptions {
+  /**
+   * Optional durable step name. Defaults to the target workflow name.
+   */
+  name?: string;
+  /**
+   * Concurrency key for the started workflow run.
+   */
+  concurrencyKey?: string;
 }
 
 /**
  * Represents the API for defining steps within a workflow. Used within a
  * workflow handler to define steps by calling `step.run()`, `step.sleep()`,
- * `step.runWorkflow()`, `step.sendSignal()`, and `step.waitForSignal()`.
+ * `step.runWorkflow()`, `step.startWorkflow()`, `step.sendSignal()`, and
+ * `step.waitForSignal()`.
  */
 export interface StepApi {
   run: <Output>(
@@ -61,12 +81,18 @@ export interface StepApi {
     input?: RunInput,
     options?: Readonly<StepRunWorkflowOptions>,
   ) => Promise<Output>;
+  startWorkflow: <Input, Output, RunInput = Input>(
+    spec: WorkflowSpec<Input, Output, RunInput>,
+    input?: RunInput,
+    options?: Readonly<StepStartWorkflowOptions>,
+  ) => Promise<{ workflowRunId: string }>;
   sleep: (name: string, duration: DurationString) => Promise<void>;
   sendSignal: (
     options: Readonly<{
       name?: string;
       signal: string;
       data?: JsonValue;
+      workflowRunId?: string;
     }>,
   ) => Promise<{ workflowRunIds: string[] }>;
   waitForSignal: <Output>(

@@ -74,11 +74,12 @@ for each scheduled run.
 
 ## Schedule Options
 
-| Option     | Description                                                                      |
-| ---------- | -------------------------------------------------------------------------------- |
-| `id`       | Schedule ID. Defaults to the exact workflow name.                                |
-| `cron`     | Required cron expression. Accepts five fields, or six fields with seconds first. |
-| `timezone` | IANA time zone. Defaults to `UTC`.                                               |
+| Option     | Description                                                                                                                          |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `id`       | Schedule ID. Defaults to the exact workflow name.                                                                                    |
+| `cron`     | Required cron expression. Accepts five fields, or six fields with seconds first.                                                     |
+| `timezone` | IANA time zone. Defaults to `UTC`.                                                                                                   |
+| `overlap`  | `"allow"` or `"skip"`. With `"skip"`, the schedule starts no run while one of its earlier runs is unfinished. Defaults to `"allow"`. |
 
 Randomized `H` fields and shorthand aliases are not supported.
 
@@ -96,9 +97,23 @@ Time zones and daylight saving time follow `cron-parser`'s default behavior. For
 example, a Chicago schedule set to 2:30 a.m. runs at 3:30 a.m. on the day clocks
 move forward.
 
-Each scheduled run is independent. A new run can start while a previous run is
-still in progress. Runs start when a worker has capacity, so the scheduled time
-is not a guaranteed start time.
+Each scheduled run is independent. With `overlap: "allow"`, a new run can start
+while a previous run is still in progress. Runs start when a worker has
+capacity, so the scheduled time is not a guaranteed start time.
+
+With `overlap: "skip"`, runs of a schedule never overlap. A start that comes due
+while an earlier run of the schedule is unfinished is skipped and is not made up
+later. Only runs created by the schedule count, not reruns or runs started
+another way.
+
+A run stays unfinished while it sleeps, waits for a signal or a child workflow,
+or retries. This includes a run whose workflow no worker has registered. The
+schedule starts nothing until that run completes, fails, or is canceled.
+
+<Note>
+  Upgrade every worker before relying on `overlap: "skip"`. Workers on an older
+  version start scheduled runs without checking for an unfinished run.
+</Note>
 
 Scheduled runs use the workflow's existing [workflow and step retry
 policies](/docs/retries).
@@ -163,6 +178,7 @@ What happens next depends on what changed:
 | Same cron expression and time zone     | Preserves the schedule's current progress.                                               |
 | Different cron expression or time zone | Moves an active schedule to its next future occurrence. A paused schedule stays paused.  |
 | Different input                        | Preserves the next scheduled time. Runs that have not yet been queued use the new input. |
+| Different `overlap`                    | Preserves the next scheduled time. The new setting applies from the next due time.       |
 
 Runs that have already been created keep their original input.
 

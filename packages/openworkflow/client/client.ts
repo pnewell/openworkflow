@@ -1,10 +1,11 @@
-import type {
-  Backend,
-  PaginatedResponse,
-  PaginationOptions,
-  SendSignalResult,
+import {
+  DEFAULT_RUN_IDEMPOTENCY_PERIOD_MS,
+  type Backend,
+  type PaginatedResponse,
+  type PaginationOptions,
+  type SendSignalResult,
 } from "../core/backend.js";
-import type { DurationString } from "../core/duration.js";
+import { parseDuration, type DurationString } from "../core/duration.js";
 import type { JsonValue } from "../core/json.js";
 import type { Logger } from "../core/logger.js";
 import {
@@ -27,7 +28,7 @@ import type {
   SchemaOutput,
   WorkflowRun,
 } from "../core/workflow-run.js";
-import { validateInput } from "../core/workflow-run.js";
+import { validateConcurrencyKey, validateInput } from "../core/workflow-run.js";
 import {
   ATTRIBUTE_NAMES,
   getSpanKind,
@@ -165,11 +166,17 @@ export class OpenWorkflow {
         }
         const parsedInput = validationResult.value;
         const availableAt = resolveAvailableAt(options?.availableAt);
+        const idempotencyPeriodMs = resolveIdempotencyPeriodMs(
+          options?.idempotencyPeriod,
+        );
+        validateConcurrencyKey(options?.concurrencyKey);
 
         const workflowRun = await this.backend.createWorkflowRun({
           workflowName: spec.name,
           version: spec.version ?? null,
           idempotencyKey: options?.idempotencyKey ?? null,
+          idempotencyPeriodMs,
+          concurrencyKey: options?.concurrencyKey ?? null,
           config: {},
           context: captureTraceContext(),
           input: parsedInput ?? null,
@@ -264,9 +271,11 @@ export class OpenWorkflow {
 
   /**
    * Send a signal to all workflows currently waiting on the given signal
-   * string. If no workflow is waiting, the signal is silently dropped.
+   * string. If no workflow is waiting, the signal is silently dropped. With
+   * `workflowRunId`, the signal is sent to that workflow run only and kept
+   * until one of its waits on the signal takes it.
    * @param options - Signal options
-   * @returns IDs of workflow runs that received the signal
+   * @returns IDs of workflow runs the signal was sent to
    * @example
    * ```ts
    * const { workflowRunIds } = await ow.sendSignal({
@@ -280,6 +289,7 @@ export class OpenWorkflow {
       signal: string;
       data?: JsonValue;
       idempotencyKey?: string;
+      workflowRunId?: string;
     }>,
   ): Promise<SendSignalResult> {
     return traceOperation(
@@ -293,6 +303,7 @@ export class OpenWorkflow {
           signal: options.signal,
           data: options.data ?? null,
           idempotencyKey: options.idempotencyKey ?? null,
+          workflowRunId: options.workflowRunId ?? null,
         });
         setAttribute(
           span,
@@ -409,9 +420,22 @@ export interface WorkflowRunOptions {
   deadlineAt?: Date;
   /**
    * Prevent duplicate workflow run creation for the same workflow and key.
-   * Reusing the same key returns the existing run for up to 24 hours.
+   * Reusing the same key returns the existing run for the idempotency period.
    */
   idempotencyKey?: string;
+  /**
+   * How long a reused `idempotencyKey` returns the existing run, measured from
+   * that run's creation. Accepts milliseconds or a duration string (e.g.
+   * "7d"). Use `0` to never expire.
+   * @default 86400000 (24 hours)
+   */
+  idempotencyPeriod?: number | DurationString;
+  /**
+   * Run one workflow run at a time among the runs in the namespace that share
+   * this key. A run holds the key from when it first starts until it
+   * completes, fails, or is canceled.
+   */
+  concurrencyKey?: string;
 }
 
 /**
@@ -427,6 +451,35 @@ function resolveAvailableAt(
   if (availableAt instanceof Date) return availableAt;
 
   const result = calculateDateFromDuration(availableAt);
+  if (!result.ok) {
+    throw result.error;
+  }
+
+  return result.value;
+}
+
+/**
+ * Resolve idempotencyPeriod to milliseconds.
+ * @param idempotencyPeriod - Milliseconds or duration string
+ * @returns Idempotency period in milliseconds
+ * @throws {Error} When the period is invalid
+ */
+function resolveIdempotencyPeriodMs(
+  idempotencyPeriod: number | DurationString | undefined,
+): number {
+  if (idempotencyPeriod === undefined) {
+    return DEFAULT_RUN_IDEMPOTENCY_PERIOD_MS;
+  }
+
+  // oxlint-disable-next-line anti-slop/no-runtime-typeof -- numeric periods are milliseconds, strings are duration expressions
+  if (typeof idempotencyPeriod === "number") {
+    if (!Number.isFinite(idempotencyPeriod) || idempotencyPeriod < 0) {
+      throw new Error("Idempotency period must be a non-negative number");
+    }
+    return idempotencyPeriod;
+  }
+
+  const result = parseDuration(idempotencyPeriod);
   if (!result.ok) {
     throw result.error;
   }

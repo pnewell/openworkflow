@@ -88,6 +88,7 @@ function ScheduleOverview({ schedule }: { schedule: WorkflowSchedule }) {
           { label: "Workflow", value: schedule.workflowName },
           { label: "Cron expression", value: schedule.cron },
           { label: "Time zone", value: schedule.timezone },
+          { label: "Overlap", value: schedule.overlap },
           { label: "Namespace", value: schedule.namespaceId },
         ].map(({ label, value }) => (
           <div key={label}>

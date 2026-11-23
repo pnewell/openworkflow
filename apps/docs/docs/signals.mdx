@@ -79,8 +79,9 @@ await ow.sendSignal({
 ```
 
 <Warning>
-  Signals are not buffered. If you send a signal before any workflow is waiting
-  for it, the signal is lost.
+  Signals sent by name are not buffered. If you send a signal before any
+  workflow is waiting for it, the signal is lost. To keep a signal until it is
+  received, [send it to one workflow run](#sending-to-one-workflow-run).
 </Warning>
 
 ## Signal Names
@@ -202,6 +203,42 @@ await ow.sendSignal({
   data: { version: 42 },
 });
 ```
+
+## Sending to One Workflow Run
+
+Pass `workflowRunId` to send a signal to one workflow run instead of every
+waiter:
+
+```ts
+const handle = await ow.runWorkflow(approvalWorkflow.spec, { orderId });
+
+await ow.sendSignal({
+  signal: `approval:${orderId}`,
+  data: { approved: true },
+  workflowRunId: handle.workflowRun.id,
+});
+```
+
+The signal is stored for that run and kept until one of its
+`step.waitForSignal()` calls on that signal name takes it, so it is never lost,
+even if the run has not started yet or is not waiting on that signal. A run
+that is waiting on the signal is woken. Each wait takes the oldest signal kept
+for its name, and a signal is taken once. A wait whose timeout has already
+passed still takes a kept signal.
+
+`workflowRunIds` contains only that run. Sending to a workflow run that has
+finished or does not exist throws an error, and nothing is kept.
+`step.sendSignal()` accepts `workflowRunId` too.
+
+With an idempotency key, a signal is kept once per run and signal name, with no
+time limit. A repeat returns that run, even after the run has finished. A send
+without `workflowRunId` that reuses the key and signal name returns that run
+too and delivers nothing.
+
+<Note>
+  Upgrade every worker before relying on signals sent to one workflow run.
+  Workers on an older version do not receive them.
+</Note>
 
 ## Sending Signals from Workflows
 

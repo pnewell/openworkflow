@@ -42,7 +42,9 @@ durable execution with minimal operational complexity.
   the workflow is woken. If no workflow is waiting at send time, the signal
   has no effect and no delivery row is persisted. A retry with the same
   idempotency key may therefore deliver to workflows that began waiting after
-  the original attempt.
+  the original attempt. A signal sent to one workflow run is instead written to
+  `workflow_signals` for that run and kept until one of the run's waits on that
+  signal name takes it.
 - **`availableAt`**: A critical timestamp on a workflow run that controls its
   visibility to workers. It is used for scheduling, heartbeating, crash
   recovery, and durable timers.
@@ -133,7 +135,8 @@ of coordination. There is no separate orchestrator server.
   The `workflow_runs` table serves as the job queue for the workers, the
   `step_attempts` table serves as a record of started and completed work
   enabling memoization, and the `workflow_signals` table records signal
-  deliveries so a waking workflow can read the payload.
+  deliveries and signals kept for a run so a waking workflow can read the
+  payload.
 
 ### 2.3. Basic Execution Flow
 
@@ -149,7 +152,9 @@ of coordination. There is no separate orchestrator server.
     status is either `pending` (new work), `running` (parked or with an expired
     lease), or legacy `sleeping`. It uses an atomic `FOR UPDATE SKIP LOCKED`
     query to claim a single workflow run, setting its status to `running` and
-    extending the lease.
+    extending the lease. A run with a concurrency key that has not been claimed
+    yet is passed over while another run holds its key or is ahead of it in
+    line.
 4.  **Code Execution (Replay Loop)**: The Worker loads the history of completed
     `step_attempts` for the claimed workflow. It then executes the workflow code
     from the beginning, using the history to memoize results of
@@ -243,9 +248,17 @@ target workflow name in `spec`) and `options.timeout` controls the wait timeout
 (default 1y). When the timeout is reached, the parent step fails but the child
 workflow continues running independently.
 
+**`step.startWorkflow(spec, input?, options?)`**: Starts a workflow run and
+returns its ID without waiting for it. The start is recorded as a step attempt
+so it won't repeat on replay. The started run is independent: it is not ended
+when the workflow that started it ends, and its completion does not wake that
+workflow.
+
 **`step.sendSignal(options)`**: Sends a named signal to all workflows currently
 waiting on it. The send is recorded as a step attempt so it won't repeat on
-replay. If no workflow is waiting, the signal is silently dropped.
+replay. If no workflow is waiting, the signal is silently dropped. With
+`workflowRunId`, the signal is sent to that workflow run only and kept until
+one of its waits takes it.
 
 ```ts
 await step.sendSignal({
@@ -257,7 +270,8 @@ await step.sendSignal({
 **`step.waitForSignal(options)`**: Parks the workflow until a matching signal
 arrives or the timeout expires. When a signal is sent targeting this signal
 name, a delivery row is written to `workflow_signals` and the workflow is woken.
-Returns `{ data }` on delivery, or `null` on timeout.
+A signal kept for the run under this signal name is taken by the wait, oldest
+first. Returns `{ data }` on delivery, or `null` on timeout.
 
 ```ts
 const result = await step.waitForSignal({
@@ -266,22 +280,30 @@ const result = await step.waitForSignal({
 });
 ```
 
-All step APIs (`step.run`, `step.sleep`, `step.runWorkflow`, `step.sendSignal`,
-and `step.waitForSignal`) share the same collision logic for durable keys. If
-duplicate base names are encountered in one execution pass, OpenWorkflow
-auto-indexes them as `name`, `name:1`, `name:2`, and so on so each step call
-maps to a distinct step attempt.
+All step APIs (`step.run`, `step.sleep`, `step.runWorkflow`,
+`step.startWorkflow`, `step.sendSignal`, and `step.waitForSignal`) share the
+same collision logic for durable keys. If duplicate base names are encountered
+in one execution pass, OpenWorkflow auto-indexes them as `name`, `name:1`,
+`name:2`, and so on so each step call maps to a distinct step attempt.
 
 ## 4. Error Handling & Retries
 
 ### 4.1. Step Failures & Retries
 
 When a step's function throws an error, the framework records the error in the
-`step_attempt` and sets its status to `failed`. The error then propagates up.
-Retry scheduling for that failure is driven by the failed-attempt count for that
-specific `stepName` in the workflow run. If retryable, the workflow run is
-rescheduled by setting `availableAt` to the computed backoff time. On the next
-execution, replay reaches the failed step and re-executes its function.
+`step_attempt` and sets its status to `failed`. Retry scheduling for that
+failure is driven by the failed-attempt count for that specific `stepName` in
+the workflow run. If retryable, the execution ends there without returning to
+the workflow code, and the workflow run is rescheduled by setting `availableAt`
+to the computed backoff time. On the next execution, replay reaches the failed
+step and re-executes its function.
+
+Because a retryable failure never reaches the workflow code, a `try/catch`
+around a step does not stop the step's retries: the `catch` runs only after the
+step's final failure, and a `finally` runs only once the step has succeeded or
+failed for good. A final failure propagates up into the workflow code and is
+replayed like a result: on later executions the step is not run again and the
+saved error is thrown again.
 
 To prevent runaway workflows from accumulating unbounded step history, execution
 enforces a default hard cap of 1000 step attempts per workflow run. When that

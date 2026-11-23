@@ -314,6 +314,75 @@ export function migrations(schema: string): string[] {
     INSERT INTO ${quotedSchema}."openworkflow_migrations" ("version")
     VALUES (7) ON CONFLICT DO NOTHING;
     COMMIT;`,
+
+    // 8 - concurrency keys
+    `BEGIN;
+
+    ALTER TABLE ${quotedSchema}."workflow_runs"
+    ADD COLUMN IF NOT EXISTS "concurrency_key" TEXT;
+
+    COMMIT;
+
+    -- statement-breakpoint
+    CREATE INDEX CONCURRENTLY IF NOT EXISTS "workflow_runs_concurrency_key_idx"
+    ON ${quotedSchema}."workflow_runs" ("namespace_id", "concurrency_key", "attempts", "available_at", "created_at", "id")
+    WHERE "concurrency_key" IS NOT NULL AND "status" IN ('pending', 'running', 'sleeping');
+
+    -- statement-breakpoint
+    BEGIN;
+
+    INSERT INTO ${quotedSchema}."openworkflow_migrations"("version")
+    VALUES (8)
+    ON CONFLICT DO NOTHING;
+
+    COMMIT;`,
+
+    // 9 - signals addressed to one workflow run
+    `BEGIN;
+
+    ALTER TABLE ${quotedSchema}."workflow_signals"
+
+    -- released versions read this column only by equality, so they never see a row where it is null
+    -- squawk-ignore ban-drop-not-null
+    ALTER COLUMN "step_attempt_id" DROP NOT NULL;
+
+    COMMIT;
+
+    -- statement-breakpoint
+    CREATE INDEX CONCURRENTLY IF NOT EXISTS "workflow_signals_pending_idx"
+    ON ${quotedSchema}."workflow_signals" ("namespace_id", "workflow_run_id", "signal", "created_at", "id")
+    WHERE "step_attempt_id" IS NULL;
+
+    -- statement-breakpoint
+    BEGIN;
+
+    INSERT INTO ${quotedSchema}."openworkflow_migrations"("version")
+    VALUES (9)
+    ON CONFLICT DO NOTHING;
+
+    COMMIT;`,
+
+    // 10 - schedule overlap
+    `BEGIN;
+
+    ALTER TABLE ${quotedSchema}."workflow_schedules"
+    ADD COLUMN IF NOT EXISTS "overlap" TEXT NOT NULL DEFAULT 'allow';
+
+    COMMIT;
+
+    -- statement-breakpoint
+    CREATE INDEX CONCURRENTLY IF NOT EXISTS "workflow_runs_workflow_schedule_id_idx"
+    ON ${quotedSchema}."workflow_runs" ("namespace_id", "workflow_schedule_id")
+    WHERE "workflow_schedule_id" IS NOT NULL AND "status" IN ('pending', 'running', 'sleeping');
+
+    -- statement-breakpoint
+    BEGIN;
+
+    INSERT INTO ${quotedSchema}."openworkflow_migrations"("version")
+    VALUES (10)
+    ON CONFLICT DO NOTHING;
+
+    COMMIT;`,
   ];
 }
 

@@ -70,7 +70,7 @@ const [a, b, c] = await Promise.all([
 
 ## Error Handling
 
-If any parallel step fails, `Promise.all` rejects with that error:
+If any parallel step fails for good, `Promise.all` rejects with that error:
 
 ```ts
 try {
@@ -87,6 +87,13 @@ try {
   console.error("Failed to fetch data:", error);
 }
 ```
+
+Catching the error does not stop a step's [retries](/docs/retries). While a
+step has retries left, a failure ends the execution and the step is retried
+when the workflow resumes, so the `catch` runs only after a step's final
+failure, and a `finally` runs only once the step has succeeded or failed for
+good. A final failure is not run again on replay; the saved error is thrown
+again.
 
 For independent operations where you want all results (including errors), use
 `Promise.allSettled`:

@@ -205,20 +205,59 @@ const handle = await ow.runWorkflow(
 
 Within a given namespace, when an existing run matches the same
 `workflowName` + `idempotencyKey`, OpenWorkflow returns that existing run
-immediately. This dedupe window is built-in and lasts 24 hours from the original
-run creation time. The same `idempotencyKey` used in a different namespace will
+immediately. This dedupe window lasts 24 hours from the original run creation
+time by default. The same `idempotencyKey` used in a different namespace will
 create a separate run.
+
+Set `idempotencyPeriod` to change the window for a call. It accepts
+milliseconds or a duration string, and `0` means the key never expires:
+
+```ts
+const handle = await ow.runWorkflow(
+  sendWelcomeEmail.spec,
+  { userId: "user_123" },
+  { idempotencyKey: "welcome-email:user_123", idempotencyPeriod: "7d" },
+);
+```
+
+### Concurrency Key (Optional)
+
+Runs that share a concurrency key run one at a time:
+
+```ts
+const handle = await ow.runWorkflow(
+  syncAccount.spec,
+  { accountId: "acct_123" },
+  { concurrencyKey: "account:acct_123" },
+);
+```
+
+Within a given namespace, runs of any workflow with the same `concurrencyKey`
+share it. A run holds the key from the moment a worker first claims it until it
+completes, fails, or is canceled, including while it sleeps, waits, and retries.
+Other runs with that key wait for it and start one at a time, in the order they
+became due and then the order they were created. A run scheduled for later is
+not in line until it is due. An empty key throws an error.
+
+Canceling a run, or its deadline passing, frees its key immediately. A step the
+run's worker is still executing is not stopped, so it can still be running when
+the next run with that key starts.
+
+<Note>
+  Upgrade every worker before relying on concurrency keys. Workers on an older
+  version start runs without checking their key.
+</Note>
 
 ## Workflow Function Parameters
 
 The workflow function receives an object with four properties:
 
-| Parameter | Type                  | Description                                                                                                    |
-| --------- | --------------------- | -------------------------------------------------------------------------------------------------------------- |
-| `input`   | Generic               | The input data passed when starting the workflow                                                               |
-| `step`    | `StepApi`             | API for defining steps (`step.run`, `step.sleep`, `step.runWorkflow`, `step.sendSignal`, `step.waitForSignal`) |
-| `version` | `string \| null`      | The workflow version, if specified                                                                             |
-| `run`     | `WorkflowRunMetadata` | Read-only run metadata snapshot (`run.id`, etc.)                                                               |
+| Parameter | Type                  | Description                                                                                                                          |
+| --------- | --------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `input`   | Generic               | The input data passed when starting the workflow                                                                                     |
+| `step`    | `StepApi`             | API for defining steps (`step.run`, `step.sleep`, `step.runWorkflow`, `step.startWorkflow`, `step.sendSignal`, `step.waitForSignal`) |
+| `version` | `string \| null`      | The workflow version, if specified                                                                                                   |
+| `run`     | `WorkflowRunMetadata` | Read-only run metadata snapshot (`run.id`, etc.)                                                                                     |
 
 ```ts
 defineWorkflow({ name: "example" }, async ({ input, step, version, run }) => {

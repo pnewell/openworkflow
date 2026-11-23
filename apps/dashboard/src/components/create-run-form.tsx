@@ -46,6 +46,7 @@ export function CreateRunForm({ onCancel, onSuccess }: CreateRunFormProps) {
   const [version, setVersion] = useState("");
   const [input, setInput] = useState("");
   const [idempotencyKey, setIdempotencyKey] = useState("");
+  const [concurrencyKey, setConcurrencyKey] = useState("");
   const [availableAt, setAvailableAt] = useState("");
   const [deadlineAt, setDeadlineAt] = useState("");
   const [inputError, setInputError] = useState<string | null>(null);
@@ -96,6 +97,7 @@ export function CreateRunForm({ onCancel, onSuccess }: CreateRunFormProps) {
           version: normalizeOptionalField(version),
           input: normalizedInput,
           idempotencyKey: idempotencyKey || null,
+          concurrencyKey: concurrencyKey || null,
           availableAt: availableAtIso,
           deadlineAt: deadlineAtIso,
         },
@@ -187,6 +189,28 @@ export function CreateRunForm({ onCancel, onSuccess }: CreateRunFormProps) {
               Reusing a key for the same workflow name in this namespace opens
               the existing run for 24 hours after creation, even with different
               input or version. Leave empty to create a new run.
+            </FieldDescription>
+          </Field>
+
+          <Field>
+            <FieldLabel htmlFor="create-run-concurrency-key">
+              Concurrency Key
+            </FieldLabel>
+            <Input
+              id="create-run-concurrency-key"
+              name="concurrencyKey"
+              value={concurrencyKey}
+              onChange={(event) => {
+                setConcurrencyKey(event.currentTarget.value);
+              }}
+              placeholder="e.g. account:acct_123"
+              aria-describedby="create-run-concurrency-key-description"
+              autoComplete="off"
+              disabled={isSubmitting}
+            />
+            <FieldDescription id="create-run-concurrency-key-description">
+              Runs in this namespace that share a key run one at a time, in the
+              order they come due. Leave empty to run without waiting.
             </FieldDescription>
           </Field>
 

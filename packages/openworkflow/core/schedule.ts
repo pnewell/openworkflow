@@ -11,6 +11,8 @@ export interface WorkflowScheduleOptions {
   cron: string;
   /** IANA timezone; defaults to UTC. */
   timezone?: string;
+  /** "skip" starts no run while an earlier one is unfinished; defaults to "allow". */
+  overlap?: "allow" | "skip";
 }
 
 /** Validated declaration persisted by the backend using last-write-wins. */
@@ -20,6 +22,7 @@ export interface WorkflowScheduleDefinition {
   input: JsonValue | null;
   cron: string;
   timezone: string;
+  overlap: "allow" | "skip";
 }
 
 /** A recurring schedule and its current dispatch cursor. */
@@ -49,6 +52,11 @@ export async function prepareWorkflowSchedule<Input, Output, RunInput>(
   const id = options.id ?? spec.name;
   validateWorkflowScheduleId(id);
   const timezone = options.timezone ?? "UTC";
+  const overlap = options.overlap ?? "allow";
+  // oxlint-disable-next-line typescript/no-unnecessary-condition -- Public schedule validation includes JavaScript inputs.
+  if (overlap !== "allow" && overlap !== "skip") {
+    throw new Error('Schedule overlap must be "allow" or "skip"');
+  }
   const expression = parseSchedule(options.cron, timezone, new Date());
   // Also reject expressions with no possible future occurrence.
   expression.next();
@@ -60,6 +68,7 @@ export async function prepareWorkflowSchedule<Input, Output, RunInput>(
     input: result.value ?? null,
     cron: expression.stringify(true),
     timezone,
+    overlap,
   };
 }
 

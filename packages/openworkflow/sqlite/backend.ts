@@ -1,7 +1,6 @@
 import {
   WorkflowRunCounts,
   DEFAULT_NAMESPACE_ID,
-  DEFAULT_RUN_IDEMPOTENCY_PERIOD_MS,
   Backend,
   CancelWorkflowRunParams,
   ClaimWorkflowRunParams,
@@ -23,8 +22,9 @@ import {
   SleepWorkflowRunParams,
   SendSignalParams,
   SendSignalResult,
-  GetSignalDeliveryParams,
+  ConsumeSignalParams,
   toWorkflowRunCounts,
+  resolveIdempotencyCutoff,
   type EnqueueScheduledRunsParams,
   type PaginationOptions,
   type WorkflowScheduleIdParams,
@@ -46,6 +46,7 @@ import { StepAttempt } from "../core/step-attempt.js";
 import { computeFailedWorkflowRunUpdate } from "../core/workflow-definition.js";
 import {
   resolveCancelWorkflowRunConflict,
+  validateSignalRecipient,
   WorkflowRun,
 } from "../core/workflow-run.js";
 import {
@@ -156,11 +157,12 @@ export class BackendSqlite implements Backend {
       .prepare(
         `
       INSERT INTO workflow_schedules
-        (namespace_id,id,workflow_name,input,cron,timezone,next_run_at,created_at,updated_at)
-      VALUES (?,?,?,?,?,?,?,?,?)
+        (namespace_id,id,workflow_name,input,cron,timezone,overlap,next_run_at,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?)
       ON CONFLICT(namespace_id,id) DO UPDATE SET
         workflow_name=excluded.workflow_name, input=excluded.input,
-        cron=excluded.cron, timezone=excluded.timezone, updated_at=excluded.updated_at,
+        cron=excluded.cron, timezone=excluded.timezone, overlap=excluded.overlap,
+        updated_at=excluded.updated_at,
         next_run_at=CASE WHEN workflow_schedules.next_run_at IS NOT NULL
           AND (workflow_schedules.cron<>excluded.cron OR workflow_schedules.timezone<>excluded.timezone)
           THEN excluded.next_run_at ELSE workflow_schedules.next_run_at END
@@ -174,6 +176,7 @@ export class BackendSqlite implements Backend {
         toJSON(params.input),
         params.cron,
         params.timezone,
+        params.overlap,
         nextScheduleOccurrence(params, now).toISOString(),
         now.toISOString(),
         now.toISOString(),
@@ -273,12 +276,12 @@ export class BackendSqlite implements Backend {
       // safety: SELECT reads due schedules while holding the writer lock.
       const rows = this.db
         .prepare(
-          `SELECT id,workflow_name,input,cron,timezone FROM workflow_schedules
+          `SELECT id,workflow_name,input,cron,timezone,overlap FROM workflow_schedules
         WHERE namespace_id=? AND next_run_at<=? ORDER BY next_run_at,id LIMIT ?`,
         )
         .all(this.namespaceId, before, params.limit) as Pick<
         WorkflowScheduleRow,
-        "id" | "workflow_name" | "input" | "cron" | "timezone"
+        "id" | "workflow_name" | "input" | "cron" | "timezone" | "overlap"
       >[];
       const update = this.db
         .prepare(`UPDATE workflow_schedules SET next_run_at=?,updated_at=?
@@ -287,6 +290,9 @@ export class BackendSqlite implements Backend {
         (namespace_id,id,workflow_name,status,config,input,attempts,
          workflow_schedule_id,available_at,created_at,updated_at)
         VALUES (?,?,?,'pending','{}',?,0,?,?,?,?)`);
+      const unfinished = this.db.prepare(`SELECT 1 FROM workflow_runs
+        WHERE namespace_id=? AND workflow_schedule_id=?
+          AND status IN ('pending','running','sleeping') LIMIT 1`);
       for (const row of rows) {
         update.run(
           nextScheduleOccurrence(row, params.before).toISOString(),
@@ -294,6 +300,8 @@ export class BackendSqlite implements Backend {
           this.namespaceId,
           row.id,
         );
+        if (row.overlap === "skip" && unfinished.get(this.namespaceId, row.id))
+          continue;
         const currentTime = now();
         insert.run(
           this.namespaceId,
@@ -333,7 +341,7 @@ export class BackendSqlite implements Backend {
       const existing = this.getWorkflowRunByIdempotencyKey(
         workflowName,
         idempotencyKey,
-        new Date(Date.now() - DEFAULT_RUN_IDEMPOTENCY_PERIOD_MS),
+        resolveIdempotencyCutoff(params.idempotencyPeriodMs),
       );
       if (existing) {
         this.db.exec("COMMIT");
@@ -447,6 +455,7 @@ export class BackendSqlite implements Backend {
         "version",
         "status",
         "idempotency_key",
+        "concurrency_key",
         "config",
         "context",
         "input",
@@ -458,7 +467,7 @@ export class BackendSqlite implements Backend {
         "created_at",
         "updated_at"
       )
-      VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
     `);
 
     stmt.run(
@@ -467,6 +476,7 @@ export class BackendSqlite implements Backend {
       params.workflowName,
       params.version,
       params.idempotencyKey,
+      params.concurrencyKey ?? null,
       toJSON(params.config),
       toJSON(params.context),
       toJSON(params.input),
@@ -540,6 +550,17 @@ export class BackendSqlite implements Backend {
 
     this.db.exec("BEGIN IMMEDIATE");
     try {
+      const workflowRunId = params.workflowRunId ?? null;
+      if (workflowRunId !== null) {
+        const result = this.sendSignalToWorkflowRun(
+          workflowRunId,
+          params,
+          currentTime,
+        );
+        this.db.exec("COMMIT");
+        return Promise.resolve(result);
+      }
+
       if (params.idempotencyKey !== null) {
         const existingStmt = this.db.prepare(`
           SELECT DISTINCT "workflow_run_id"
@@ -645,22 +666,196 @@ export class BackendSqlite implements Backend {
     }
   }
 
-  getSignalDelivery(
-    params: GetSignalDeliveryParams,
+  /**
+   * Keep a signal for one workflow run until one of its waits takes it, and
+   * wake the run if it is waiting on the signal. Must run inside a transaction.
+   * @param workflowRunId - Workflow run the signal is addressed to
+   * @param params - Send params
+   * @param currentTime - Current timestamp
+   * @returns The addressed workflow run
+   */
+  private sendSignalToWorkflowRun(
+    workflowRunId: string,
+    params: SendSignalParams,
+    currentTime: string,
+  ): SendSignalResult {
+    const workflowRunStmt = this.db.prepare(`
+      SELECT "status"
+      FROM "workflow_runs"
+      WHERE "namespace_id" = ? AND "id" = ?
+    `);
+    // safety: backend transitions write domain status values.
+    const workflowRun = workflowRunStmt.get(this.namespaceId, workflowRunId) as
+      Pick<WorkflowRun, "status"> | null | undefined;
+
+    if (params.idempotencyKey !== null) {
+      const existingStmt = this.db.prepare(`
+        SELECT 1
+        FROM "workflow_signals"
+        WHERE "namespace_id" = ?
+          AND "signal" = ?
+          AND "sender_idempotency_key" = ?
+          AND "workflow_run_id" = ?
+        LIMIT 1
+      `);
+      const existing = existingStmt.get(
+        this.namespaceId,
+        params.signal,
+        params.idempotencyKey,
+        workflowRunId,
+      );
+      if (existing) {
+        return { workflowRunIds: [workflowRunId] };
+      }
+    }
+
+    validateSignalRecipient(workflowRunId, workflowRun ?? null);
+
+    const insertStmt = this.db.prepare(`
+      INSERT INTO "workflow_signals" (
+        "namespace_id", "id", "signal", "data",
+        "sender_idempotency_key", "workflow_run_id",
+        "created_at"
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `);
+    insertStmt.run(
+      this.namespaceId,
+      generateUUID(),
+      params.signal,
+      toJSON(params.data),
+      params.idempotencyKey,
+      workflowRunId,
+      currentTime,
+    );
+
+    // wake the workflow run if it is waiting on the signal
+    const wakeStmt = this.db.prepare(`
+      UPDATE "workflow_runs"
+      SET
+        "available_at" = CASE
+          WHEN "available_at" IS NULL OR "available_at" > ? THEN ?
+          ELSE "available_at"
+        END,
+        "updated_at" = ?
+      WHERE "namespace_id" = ?
+        AND "id" = ?
+        AND "worker_id" IS NULL
+        AND EXISTS (
+          SELECT 1
+          FROM "step_attempts" sa
+          WHERE sa."namespace_id" = "workflow_runs"."namespace_id"
+            AND sa."workflow_run_id" = "workflow_runs"."id"
+            AND sa."kind" = 'signal-wait'
+            AND sa."status" = 'running'
+            AND json_extract(sa."context", '$.signal') = ?
+        )
+    `);
+    wakeStmt.run(
+      currentTime,
+      currentTime,
+      currentTime,
+      this.namespaceId,
+      workflowRunId,
+      params.signal,
+    );
+
+    return { workflowRunIds: [workflowRunId] };
+  }
+
+  // oxlint-disable-next-line typescript/require-await -- keep the transaction synchronous
+  async consumeSignal(
+    params: ConsumeSignalParams,
   ): Promise<JsonValue | undefined> {
     const stmt = this.db.prepare(`
-      SELECT "data"
+      SELECT "data", "step_attempt_id"
       FROM "workflow_signals"
-      WHERE "namespace_id" = ? AND "step_attempt_id" = ?
+      WHERE "namespace_id" = ?
+        AND (
+          "step_attempt_id" = ?
+          OR (
+            "step_attempt_id" IS NULL
+            AND "workflow_run_id" = ?
+            AND "signal" = ?
+          )
+        )
+      ORDER BY "step_attempt_id" ASC NULLS LAST
       LIMIT 1
     `);
-    // safety: the query selects the nullable JSON text column from the signal delivery.
-    const row = stmt.get(this.namespaceId, params.stepAttemptId) as
-      { data: string | null } | null | undefined;
+    // safety: the query selects the nullable JSON text and step attempt columns from the signal.
+    const row = stmt.get(
+      this.namespaceId,
+      params.stepAttemptId,
+      params.workflowRunId,
+      params.signal,
+    ) as
+      | { data: string | null; step_attempt_id: string | null }
+      | null
+      | undefined;
 
-    // oxlint-disable-next-line unicorn/no-useless-undefined
-    if (!row) return Promise.resolve<JsonValue | undefined>(undefined);
-    return Promise.resolve(fromJSON(row.data));
+    if (!row) return undefined;
+    if (row.step_attempt_id !== null) return fromJSON(row.data);
+
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const ownedStmt = this.db.prepare(`
+        SELECT 1
+        FROM "workflow_runs"
+        WHERE ${RUNNING_WORKFLOW_RUN_OWNED_WHERE}
+      `);
+      requireRow(
+        ownedStmt.get(...this.runningWorkflowRunOwnedParams(params)),
+        "consume signal",
+      );
+
+      const deliveryStmt = this.db.prepare(`
+        SELECT "data"
+        FROM "workflow_signals"
+        WHERE "namespace_id" = ? AND "step_attempt_id" = ?
+        LIMIT 1
+      `);
+      // safety: the query selects the nullable JSON text column from the signal delivery.
+      const delivery = deliveryStmt.get(
+        this.namespaceId,
+        params.stepAttemptId,
+      ) as { data: string | null } | null | undefined;
+      if (delivery) {
+        this.db.exec("COMMIT");
+        return fromJSON(delivery.data);
+      }
+
+      // the oldest kept signal goes to the wait
+      const takeStmt = this.db.prepare(`
+        UPDATE "workflow_signals"
+        SET "step_attempt_id" = ?
+        WHERE "namespace_id" = ?
+          AND "id" = (
+            SELECT "id"
+            FROM "workflow_signals"
+            WHERE "namespace_id" = ?
+              AND "workflow_run_id" = ?
+              AND "signal" = ?
+              AND "step_attempt_id" IS NULL
+            ORDER BY "created_at" ASC, rowid ASC
+            LIMIT 1
+          )
+        RETURNING "data"
+      `);
+      // safety: the query returns the nullable JSON text column from the signal.
+      const taken = takeStmt.get(
+        params.stepAttemptId,
+        this.namespaceId,
+        this.namespaceId,
+        params.workflowRunId,
+        params.signal,
+      ) as { data: string | null } | null | undefined;
+
+      this.db.exec("COMMIT");
+      return taken ? fromJSON(taken.data) : undefined;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   async claimWorkflowRun(
@@ -700,11 +895,37 @@ export class BackendSqlite implements Backend {
       // 2. find an available workflow run to claim
       const findStmt = this.db.prepare(`
         SELECT "id"
-        FROM "workflow_runs"
+        FROM "workflow_runs" AS c
         WHERE "namespace_id" = ?
           AND "status" IN ('pending', 'running', 'sleeping')
           AND "available_at" <= ?
           AND ("deadline_at" IS NULL OR "deadline_at" > ?)
+          AND (
+            "concurrency_key" IS NULL
+            OR "attempts" > 0
+            OR (
+              NOT EXISTS (
+                SELECT 1
+                FROM "workflow_runs" AS holder
+                WHERE holder."namespace_id" = c."namespace_id"
+                  AND holder."concurrency_key" = c."concurrency_key"
+                  AND holder."status" IN ('pending', 'running', 'sleeping')
+                  AND holder."attempts" > 0
+                  AND (holder."deadline_at" IS NULL OR holder."deadline_at" > ?)
+              )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM "workflow_runs" AS ahead
+                WHERE ahead."namespace_id" = c."namespace_id"
+                  AND ahead."concurrency_key" = c."concurrency_key"
+                  AND ahead."status" IN ('pending', 'running', 'sleeping')
+                  AND ahead."attempts" = 0
+                  AND (ahead."deadline_at" IS NULL OR ahead."deadline_at" > ?)
+                  AND (ahead."available_at", ahead."created_at", ahead.rowid)
+                    < (c."available_at", c."created_at", c.rowid)
+              )
+            )
+          )
         ORDER BY
           CASE WHEN "status" = 'pending' THEN 0 ELSE 1 END,
           "available_at",
@@ -715,6 +936,8 @@ export class BackendSqlite implements Backend {
       // safety: the query selects the workflow_runs non-null text id column, or returns no row.
       const candidate = findStmt.get(
         this.namespaceId,
+        currentTime,
+        currentTime,
         currentTime,
         currentTime,
       ) as { id: string } | null | undefined;
@@ -810,6 +1033,19 @@ export class BackendSqlite implements Backend {
               JOIN "workflow_signals" ws
                 ON ws."namespace_id" = sa."namespace_id"
                 AND ws."step_attempt_id" = sa."id"
+              WHERE sa."namespace_id" = "workflow_runs"."namespace_id"
+              AND sa."workflow_run_id" = "workflow_runs"."id"
+              AND sa."kind" = 'signal-wait'
+              AND sa."status" = 'running'
+            )
+            OR EXISTS (
+              SELECT 1
+              FROM "step_attempts" sa
+              JOIN "workflow_signals" ws
+                ON ws."namespace_id" = sa."namespace_id"
+                AND ws."workflow_run_id" = sa."workflow_run_id"
+                AND ws."signal" = json_extract(sa."context", '$.signal')
+                AND ws."step_attempt_id" IS NULL
               WHERE sa."namespace_id" = "workflow_runs"."namespace_id"
               AND sa."workflow_run_id" = "workflow_runs"."id"
               AND sa."kind" = 'signal-wait'
@@ -1364,6 +1600,7 @@ interface WorkflowRunRow extends Record<string, SQLOutputValue> {
   version: string | null;
   status: string;
   idempotency_key: string | null;
+  concurrency_key: string | null;
   config: string;
   context: string | null;
   input: string | null;
@@ -1447,6 +1684,7 @@ function rowToWorkflowRun(row: WorkflowRunRow): WorkflowRun {
     // safety: the status column is written by backend transitions using the domain status values.
     status: row.status as WorkflowRun["status"],
     idempotencyKey: row.idempotency_key,
+    concurrencyKey: row.concurrency_key,
     config,
     context: fromJSON(row.context),
     input: fromJSON(row.input),
@@ -1506,6 +1744,7 @@ interface WorkflowScheduleRow extends Record<string, SQLOutputValue> {
   input: string | null;
   cron: string;
   timezone: string;
+  overlap: string;
   next_run_at: string | null;
   created_at: string;
   updated_at: string;
@@ -1524,6 +1763,8 @@ function rowToWorkflowSchedule(row: WorkflowScheduleRow): WorkflowSchedule {
     input: fromJSON(row.input),
     cron: row.cron,
     timezone: row.timezone,
+    // safety: the overlap column is written from WorkflowScheduleDefinition.overlap.
+    overlap: row.overlap as WorkflowSchedule["overlap"],
     nextRunAt: fromISO(row.next_run_at),
     createdAt: new Date(row.created_at),
     updatedAt: new Date(row.updated_at),

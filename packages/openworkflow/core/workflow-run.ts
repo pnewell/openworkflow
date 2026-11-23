@@ -56,6 +56,41 @@ export function resolveCancelWorkflowRunConflict(
 }
 
 /**
+ * Validate the workflow run a signal is addressed to.
+ * @param workflowRunId - ID of the workflow run (used in error messages)
+ * @param existing - Current workflow run, or null if not found
+ * @throws {Error} If the run does not exist or is in a terminal state
+ */
+export function validateSignalRecipient(
+  workflowRunId: string,
+  existing: Readonly<Pick<WorkflowRun, "status">> | null,
+): void {
+  if (!existing) {
+    throw new Error(`Workflow run ${workflowRunId} does not exist`);
+  }
+
+  if (isTerminalStatus(existing.status)) {
+    throw new Error(
+      `Cannot send signal to workflow run ${workflowRunId} with status ${existing.status}`,
+    );
+  }
+}
+
+/**
+ * Validate the concurrency key for a new workflow run.
+ * @param concurrencyKey - Concurrency key, when one was given
+ */
+export function validateConcurrencyKey(concurrencyKey?: string): void {
+  if (
+    concurrencyKey !== undefined &&
+    // oxlint-disable-next-line anti-slop/no-runtime-typeof -- Validate untyped JavaScript callers too.
+    (typeof concurrencyKey !== "string" || concurrencyKey.length === 0)
+  ) {
+    throw new Error("A concurrency key must be a nonempty string");
+  }
+}
+
+/**
  * WorkflowRun represents a single execution instance of a workflow.
  */
 export interface WorkflowRun {
@@ -66,6 +101,7 @@ export interface WorkflowRun {
   version: string | null;
   status: WorkflowRunStatus;
   idempotencyKey: string | null;
+  concurrencyKey: string | null;
   config: JsonValue; // user-defined config
   context: JsonValue | null; // runtime execution metadata
   input: JsonValue | null;

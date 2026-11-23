@@ -1,7 +1,7 @@
 import {
   toWorkflowRunCounts,
+  resolveIdempotencyCutoff,
   DEFAULT_NAMESPACE_ID,
-  DEFAULT_RUN_IDEMPOTENCY_PERIOD_MS,
   Backend,
   WorkflowRunCounts,
   CancelWorkflowRunParams,
@@ -24,7 +24,7 @@ import {
   SleepWorkflowRunParams,
   SendSignalParams,
   SendSignalResult,
-  GetSignalDeliveryParams,
+  ConsumeSignalParams,
   type EnqueueScheduledRunsParams,
   type PaginationOptions,
   type WorkflowScheduleIdParams,
@@ -47,6 +47,7 @@ import { StepAttempt } from "../core/step-attempt.js";
 import { computeFailedWorkflowRunUpdate } from "../core/workflow-definition.js";
 import {
   resolveCancelWorkflowRunConflict,
+  validateSignalRecipient,
   WorkflowRun,
 } from "../core/workflow-run.js";
 import {
@@ -72,6 +73,7 @@ const workflowRunColumns = [
   "version",
   "status",
   "idempotency_key",
+  "concurrency_key",
   "config",
   "context",
   "input",
@@ -243,12 +245,13 @@ export class BackendPostgres implements Backend {
     const now = new Date();
     const [row] = await pg<WorkflowSchedule[]>`
       INSERT INTO ${pg(this.schema)}."workflow_schedules" AS s
-        (namespace_id,id,workflow_name,input,cron,timezone,next_run_at,created_at,updated_at)
+        (namespace_id,id,workflow_name,input,cron,timezone,overlap,next_run_at,created_at,updated_at)
       VALUES (${this.namespaceId},${params.id},${params.workflowName},${pg.json(params.input)},
-        ${params.cron},${params.timezone},${nextScheduleOccurrence(params, now)},${now},${now})
+        ${params.cron},${params.timezone},${params.overlap},${nextScheduleOccurrence(params, now)},${now},${now})
       ON CONFLICT(namespace_id,id) DO UPDATE SET
         workflow_name=excluded.workflow_name, input=excluded.input,
-        cron=excluded.cron, timezone=excluded.timezone, updated_at=excluded.updated_at,
+        cron=excluded.cron, timezone=excluded.timezone, overlap=excluded.overlap,
+        updated_at=excluded.updated_at,
         next_run_at=CASE WHEN s.next_run_at IS NOT NULL
           AND (s.cron<>excluded.cron OR s.timezone<>excluded.timezone)
           THEN excluded.next_run_at ELSE s.next_run_at END
@@ -339,14 +342,19 @@ export class BackendPostgres implements Backend {
           UPDATE ${tx(this.schema)}."workflow_schedules" s
           SET next_run_at=a.next_run_at,updated_at=${params.before}
           FROM advances a WHERE s.namespace_id=${this.namespaceId} AND s.id=a.id
-          RETURNING s.namespace_id,s.id,s.workflow_name,s.input
+          RETURNING s.namespace_id,s.id,s.workflow_name,s.input,s.overlap
         )
         INSERT INTO ${tx(this.schema)}."workflow_runs"
           (namespace_id,id,workflow_name,status,config,input,attempts,
            workflow_schedule_id,available_at,created_at,updated_at)
         SELECT namespace_id,gen_random_uuid(),workflow_name,'pending','{}'::jsonb,input,0,
           id,${params.before},date_trunc('milliseconds',clock_timestamp()),clock_timestamp()
-        FROM advanced
+        FROM advanced a
+        WHERE a.overlap='allow' OR NOT EXISTS (
+          SELECT 1 FROM ${tx(this.schema)}."workflow_runs" r
+          WHERE r.namespace_id=a.namespace_id AND r.workflow_schedule_id=a.id
+            AND r.status IN ('pending','running','sleeping')
+        )
       `;
       return schedules.length;
     });
@@ -376,7 +384,7 @@ export class BackendPostgres implements Backend {
         tx,
         workflowName,
         idempotencyKey,
-        new Date(Date.now() - DEFAULT_RUN_IDEMPOTENCY_PERIOD_MS),
+        resolveIdempotencyCutoff(params.idempotencyPeriodMs),
       );
       if (existing) {
         return existing;
@@ -446,6 +454,7 @@ export class BackendPostgres implements Backend {
         "version",
         "status",
         "idempotency_key",
+        "concurrency_key",
         "config",
         "context",
         "input",
@@ -464,6 +473,7 @@ export class BackendPostgres implements Backend {
         ${params.version},
         'pending',
         ${params.idempotencyKey},
+        ${params.concurrencyKey ?? null},
         ${pg.json(params.config)},
         ${pg.json(params.context)},
         ${pg.json(params.input)},
@@ -523,21 +533,13 @@ export class BackendPostgres implements Backend {
 
   async sendSignal(params: SendSignalParams): Promise<SendSignalResult> {
     return await this.withTransaction(async (tx) => {
+      const workflowRunId = params.workflowRunId ?? null;
+      if (workflowRunId !== null) {
+        return await this.sendSignalToWorkflowRun(tx, workflowRunId, params);
+      }
+
       const stepAttemptsTable = this.stepAttemptsTable(tx);
       const workflowSignalsTable = this.workflowSignalsTable(tx);
-
-      if (params.idempotencyKey !== null) {
-        const existing = await tx<{ workflowRunId: string }[]>`
-            SELECT DISTINCT "workflow_run_id" AS "workflowRunId"
-            FROM ${workflowSignalsTable}
-            WHERE "namespace_id" = ${this.namespaceId}
-              AND "signal" = ${params.signal}
-              AND "sender_idempotency_key" = ${params.idempotencyKey}
-          `;
-        if (existing.length > 0) {
-          return { workflowRunIds: existing.map((r) => r.workflowRunId) };
-        }
-      }
       const workflowRunsTable = this.workflowRunsTable(tx);
 
       const waiters = await tx<{ id: string; workflowRunId: string }[]>`
@@ -553,6 +555,19 @@ export class BackendPostgres implements Backend {
             AND wr."status" IN ('pending', 'running', 'sleeping')
           FOR UPDATE OF wr, sa
         `;
+
+      if (params.idempotencyKey !== null) {
+        const existing = await tx<{ workflowRunId: string }[]>`
+            SELECT DISTINCT "workflow_run_id" AS "workflowRunId"
+            FROM ${workflowSignalsTable}
+            WHERE "namespace_id" = ${this.namespaceId}
+              AND "signal" = ${params.signal}
+              AND "sender_idempotency_key" = ${params.idempotencyKey}
+          `;
+        if (existing.length > 0) {
+          return { workflowRunIds: existing.map((r) => r.workflowRunId) };
+        }
+      }
 
       if (waiters.length === 0) {
         return { workflowRunIds: [] };
@@ -609,20 +624,153 @@ export class BackendPostgres implements Backend {
     });
   }
 
-  async getSignalDelivery(
-    params: GetSignalDeliveryParams,
-  ): Promise<JsonValue | undefined> {
-    const workflowSignalsTable = this.workflowSignalsTable();
+  /**
+   * Keep a signal for one workflow run until one of its waits takes it, and
+   * wake the run if it is waiting on the signal.
+   * @param tx - Transaction
+   * @param workflowRunId - Workflow run the signal is addressed to
+   * @param params - Send params
+   * @returns The addressed workflow run
+   */
+  private async sendSignalToWorkflowRun(
+    tx: Postgres,
+    workflowRunId: string,
+    params: SendSignalParams,
+  ): Promise<SendSignalResult> {
+    const stepAttemptsTable = this.stepAttemptsTable(tx);
+    const workflowSignalsTable = this.workflowSignalsTable(tx);
+    const workflowRunsTable = this.workflowRunsTable(tx);
 
-    const [row] = await this.pg<{ data: JsonValue | null }[]>`
-      SELECT "data"
-      FROM ${workflowSignalsTable}
+    const [workflowRun] = await tx<Pick<WorkflowRun, "status">[]>`
+      SELECT "status"
+      FROM ${workflowRunsTable}
       WHERE "namespace_id" = ${this.namespaceId}
-        AND "step_attempt_id" = ${params.stepAttemptId}
+        AND "id" = ${workflowRunId}
+      FOR UPDATE
+    `;
+
+    if (params.idempotencyKey !== null) {
+      const [existing] = await tx`
+        SELECT 1
+        FROM ${workflowSignalsTable}
+        WHERE "namespace_id" = ${this.namespaceId}
+          AND "signal" = ${params.signal}
+          AND "sender_idempotency_key" = ${params.idempotencyKey}
+          AND "workflow_run_id" = ${workflowRunId}
+        LIMIT 1
+      `;
+      if (existing) {
+        return { workflowRunIds: [workflowRunId] };
+      }
+    }
+
+    validateSignalRecipient(workflowRunId, workflowRun ?? null);
+
+    await tx`
+      INSERT INTO ${workflowSignalsTable} (
+        "namespace_id", "id", "signal", "data",
+        "sender_idempotency_key", "workflow_run_id",
+        "created_at"
+      )
+      VALUES (
+        ${this.namespaceId},
+        gen_random_uuid(),
+        ${params.signal},
+        ${tx.json(params.data)},
+        ${params.idempotencyKey},
+        ${workflowRunId},
+        NOW()
+      )
+    `;
+
+    // wake the workflow run if it is waiting on the signal
+    await tx`
+      UPDATE ${workflowRunsTable} wr
+      SET
+        "available_at" = CASE
+          WHEN wr."available_at" IS NULL OR wr."available_at" > NOW()
+            THEN NOW()
+          ELSE wr."available_at"
+        END,
+        "updated_at" = NOW()
+      WHERE wr."namespace_id" = ${this.namespaceId}
+        AND wr."id" = ${workflowRunId}
+        AND wr."worker_id" IS NULL
+        AND EXISTS (
+          SELECT 1
+          FROM ${stepAttemptsTable} sa
+          WHERE sa."namespace_id" = wr."namespace_id"
+            AND sa."workflow_run_id" = wr."id"
+            AND sa."kind" = 'signal-wait'
+            AND sa."status" = 'running'
+            AND sa."context"->>'signal' = ${params.signal}
+        )
+    `;
+
+    return { workflowRunIds: [workflowRunId] };
+  }
+
+  async consumeSignal(
+    params: ConsumeSignalParams,
+  ): Promise<JsonValue | undefined> {
+    const [row] = await this.pg<
+      { data: JsonValue | null; stepAttemptId: string | null }[]
+    >`
+      SELECT "data", "step_attempt_id" AS "stepAttemptId"
+      FROM ${this.workflowSignalsTable()}
+      WHERE "namespace_id" = ${this.namespaceId}
+        AND (
+          "step_attempt_id" = ${params.stepAttemptId}
+          OR (
+            "step_attempt_id" IS NULL
+            AND "workflow_run_id" = ${params.workflowRunId}
+            AND "signal" = ${params.signal}
+          )
+        )
+      ORDER BY "step_attempt_id" ASC NULLS LAST
       LIMIT 1
     `;
 
-    return row ? (row.data ?? null) : undefined;
+    if (!row) return undefined;
+    if (row.stepAttemptId !== null) return row.data ?? null;
+
+    return await this.withTransaction(async (tx) => {
+      const workflowSignalsTable = this.workflowSignalsTable(tx);
+
+      const [owned] = await tx`
+        ${this.runningWorkflowRunOwnedByWorkerForUpdate(params)}
+      `;
+      requireRow(owned, "consume signal");
+
+      const [delivered] = await tx<{ data: JsonValue | null }[]>`
+        SELECT "data"
+        FROM ${workflowSignalsTable}
+        WHERE "namespace_id" = ${this.namespaceId}
+          AND "step_attempt_id" = ${params.stepAttemptId}
+        LIMIT 1
+      `;
+      if (delivered) return delivered.data ?? null;
+
+      // the oldest kept signal goes to the wait
+      const [taken] = await tx<{ data: JsonValue | null }[]>`
+        UPDATE ${workflowSignalsTable}
+        SET "step_attempt_id" = ${params.stepAttemptId}
+        WHERE "namespace_id" = ${this.namespaceId}
+          AND "id" = (
+            SELECT "id"
+            FROM ${workflowSignalsTable}
+            WHERE "namespace_id" = ${this.namespaceId}
+              AND "workflow_run_id" = ${params.workflowRunId}
+              AND "signal" = ${params.signal}
+              AND "step_attempt_id" IS NULL
+            ORDER BY "created_at" ASC, "id" ASC
+            LIMIT 1
+          )
+        RETURNING "data"
+      `;
+
+      return taken ? (taken.data ?? null) : undefined;
+    });
   }
 
   async listWorkflowRuns(
@@ -690,17 +838,54 @@ export class BackendPostgres implements Backend {
   async claimWorkflowRun(
     params: ClaimWorkflowRunParams,
   ): Promise<WorkflowRun | null> {
+    const picked = await this.claimNextWorkflowRun(this.pg, params, null);
+    if (!picked || picked.attempts > 0) {
+      return picked ?? null;
+    }
+
+    // a keyed run that has not been claimed yet is claimed under its key's lock
+    const lockScope = JSON.stringify({
+      namespaceId: this.namespaceId,
+      concurrencyKey: picked.concurrencyKey,
+    });
+
+    return await this.withTransaction(async (tx) => {
+      await tx.unsafe(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0::bigint))",
+        [lockScope],
+      );
+
+      const claimed = await this.claimNextWorkflowRun(tx, params, picked.id);
+      return claimed ?? null;
+    });
+  }
+
+  /**
+   * Claim the next available workflow run. A run with a concurrency key that
+   * has not been claimed yet is passed over while another run holds its key or
+   * is ahead of it in line, and is returned unclaimed unless it is the run
+   * being claimed under its key's lock.
+   * @param pg - Postgres client or transaction
+   * @param params - Claim params
+   * @param lockedWorkflowRunId - Unclaimed run whose key lock is held, if any
+   * @returns The claimed run, or the unclaimed run that needs its key's lock
+   */
+  private async claimNextWorkflowRun(
+    pg: Postgres,
+    params: ClaimWorkflowRunParams,
+    lockedWorkflowRunId: string | null,
+  ): Promise<WorkflowRun | undefined> {
     // 1. mark any deadline-expired workflow runs as failed
     // 2. find an available workflow run to claim
     // 3. claim the workflow run
-    const workflowRunsTable = this.workflowRunsTable();
+    const workflowRunsTable = this.workflowRunsTable(pg);
 
-    const [claimed] = await this.pg<WorkflowRun[]>`
+    const [workflowRun] = await pg<WorkflowRun[]>`
       WITH expired AS (
         UPDATE ${workflowRunsTable}
         SET
           "status" = 'failed',
-          "error" = ${this.pg.json({ message: "Workflow run deadline exceeded" })},
+          "error" = ${pg.json({ message: "Workflow run deadline exceeded" })},
           "worker_id" = NULL,
           "available_at" = NULL,
           "finished_at" = NOW(),
@@ -712,34 +897,75 @@ export class BackendPostgres implements Backend {
         RETURNING "id"
       ),
       candidate AS (
-        SELECT "id"
-        FROM ${workflowRunsTable}
+        SELECT ${pg(workflowRunColumns)}
+        FROM ${workflowRunsTable} AS c
         WHERE "namespace_id" = ${this.namespaceId}
           AND "status" IN ('pending', 'running', 'sleeping')
           AND "available_at" <= NOW()
           AND ("deadline_at" IS NULL OR "deadline_at" > NOW())
+          AND ${
+            lockedWorkflowRunId === null
+              ? pg`TRUE`
+              : pg`"id" = ${lockedWorkflowRunId} AND "attempts" = 0`
+          }
+          AND (
+            "concurrency_key" IS NULL
+            OR "attempts" > 0
+            OR (
+              NOT EXISTS (
+                SELECT 1
+                FROM ${workflowRunsTable} AS holder
+                WHERE holder."namespace_id" = c."namespace_id"
+                  AND holder."concurrency_key" = c."concurrency_key"
+                  AND holder."status" IN ('pending', 'running', 'sleeping')
+                  AND holder."attempts" > 0
+                  AND (holder."deadline_at" IS NULL OR holder."deadline_at" > NOW())
+              )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM ${workflowRunsTable} AS ahead
+                WHERE ahead."namespace_id" = c."namespace_id"
+                  AND ahead."concurrency_key" = c."concurrency_key"
+                  AND ahead."status" IN ('pending', 'running', 'sleeping')
+                  AND ahead."attempts" = 0
+                  AND (ahead."deadline_at" IS NULL OR ahead."deadline_at" > NOW())
+                  AND (ahead."available_at", ahead."created_at", ahead."id")
+                    < (c."available_at", c."created_at", c."id")
+              )
+            )
+          )
         ORDER BY
           CASE WHEN "status" = 'pending' THEN 0 ELSE 1 END,
           "available_at",
           "created_at"
         LIMIT 1
         FOR UPDATE SKIP LOCKED
+      ),
+      claimed AS (
+        UPDATE ${workflowRunsTable} AS wr
+        SET
+          "status" = 'running',
+          "attempts" = wr."attempts" + 1,
+          "worker_id" = ${params.workerId},
+          "available_at" = NOW() + ${params.leaseDurationMs} * INTERVAL '1 millisecond',
+          "started_at" = COALESCE(wr."started_at", NOW()),
+          "updated_at" = NOW()
+        FROM candidate
+        WHERE wr."id" = candidate."id"
+          AND wr."namespace_id" = ${this.namespaceId}
+          AND (
+            candidate."concurrency_key" IS NULL
+            OR candidate."attempts" > 0
+            OR candidate."id" = ${lockedWorkflowRunId}
+          )
+        RETURNING ${pg(workflowRunColumns.map((column) => `wr.${column}`))}
       )
-      UPDATE ${workflowRunsTable} AS wr
-      SET
-        "status" = 'running',
-        "attempts" = "attempts" + 1,
-        "worker_id" = ${params.workerId},
-        "available_at" = NOW() + ${params.leaseDurationMs} * INTERVAL '1 millisecond',
-        "started_at" = COALESCE("started_at", NOW()),
-        "updated_at" = NOW()
-      FROM candidate
-      WHERE wr."id" = candidate."id"
-        AND wr."namespace_id" = ${this.namespaceId}
-      RETURNING ${this.pg(workflowRunColumns.map((column) => `wr.${column}`))};
+      SELECT * FROM claimed
+      UNION ALL
+      SELECT * FROM candidate WHERE NOT EXISTS (SELECT 1 FROM claimed);
     `;
 
-    return claimed ?? null;
+    return workflowRun;
   }
 
   async extendWorkflowRunLease(
@@ -836,6 +1062,19 @@ export class BackendPostgres implements Backend {
           JOIN ${this.workflowSignalsTable()} ws
             ON ws."namespace_id" = sa."namespace_id"
             AND ws."step_attempt_id" = sa."id"
+          WHERE sa."namespace_id" = wr."namespace_id"
+          AND sa."workflow_run_id" = wr."id"
+          AND sa."kind" = 'signal-wait'
+          AND sa."status" = 'running'
+        )
+        OR EXISTS (
+          SELECT 1
+          FROM ${stepAttemptsTable} sa
+          JOIN ${this.workflowSignalsTable()} ws
+            ON ws."namespace_id" = sa."namespace_id"
+            AND ws."workflow_run_id" = sa."workflow_run_id"
+            AND ws."signal" = sa."context"->>'signal'
+            AND ws."step_attempt_id" IS NULL
           WHERE sa."namespace_id" = wr."namespace_id"
           AND sa."workflow_run_id" = wr."id"
           AND sa."kind" = 'signal-wait'
