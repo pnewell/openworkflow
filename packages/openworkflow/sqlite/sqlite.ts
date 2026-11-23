@@ -248,6 +248,41 @@ export function migrations(): string[] {
 
     INSERT OR IGNORE INTO "openworkflow_migrations" ("version")
     VALUES (8);`,
+
+    // 9 - signals addressed to one workflow run
+    `CREATE TABLE "workflow_signals_new" (
+      "namespace_id" TEXT NOT NULL,
+      "id" TEXT NOT NULL,
+      "signal" TEXT NOT NULL,
+      "data" TEXT,
+      "sender_idempotency_key" TEXT,
+      "workflow_run_id" TEXT NOT NULL,
+      "step_attempt_id" TEXT,
+      "created_at" TEXT NOT NULL,
+      PRIMARY KEY ("namespace_id", "id")
+    );
+
+    INSERT INTO "workflow_signals_new"
+    SELECT "namespace_id", "id", "signal", "data", "sender_idempotency_key", "workflow_run_id", "step_attempt_id", "created_at"
+    FROM "workflow_signals";
+
+    DROP TABLE "workflow_signals";
+
+    ALTER TABLE "workflow_signals_new" RENAME TO "workflow_signals";
+
+    CREATE UNIQUE INDEX "workflow_signals_step_attempt_idx"
+    ON "workflow_signals" ("namespace_id", "step_attempt_id");
+
+    CREATE INDEX "workflow_signals_idempotency_idx"
+    ON "workflow_signals" ("namespace_id", "signal", "sender_idempotency_key")
+    WHERE "sender_idempotency_key" IS NOT NULL;
+
+    CREATE INDEX "workflow_signals_pending_idx"
+    ON "workflow_signals" ("namespace_id", "workflow_run_id", "signal", "created_at", "id")
+    WHERE "step_attempt_id" IS NULL;
+
+    INSERT OR IGNORE INTO "openworkflow_migrations" ("version")
+    VALUES (9);`,
   ];
 }
 

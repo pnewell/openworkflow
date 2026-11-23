@@ -271,9 +271,11 @@ export class OpenWorkflow {
 
   /**
    * Send a signal to all workflows currently waiting on the given signal
-   * string. If no workflow is waiting, the signal is silently dropped.
+   * string. If no workflow is waiting, the signal is silently dropped. With
+   * `workflowRunId`, the signal is sent to that workflow run only and kept
+   * until one of its waits on the signal takes it.
    * @param options - Signal options
-   * @returns IDs of workflow runs that received the signal
+   * @returns IDs of workflow runs the signal was sent to
    * @example
    * ```ts
    * const { workflowRunIds } = await ow.sendSignal({
@@ -287,6 +289,7 @@ export class OpenWorkflow {
       signal: string;
       data?: JsonValue;
       idempotencyKey?: string;
+      workflowRunId?: string;
     }>,
   ): Promise<SendSignalResult> {
     return traceOperation(
@@ -300,6 +303,7 @@ export class OpenWorkflow {
           signal: options.signal,
           data: options.data ?? null,
           idempotencyKey: options.idempotencyKey ?? null,
+          workflowRunId: options.workflowRunId ?? null,
         });
         setAttribute(
           span,

@@ -22,7 +22,7 @@ import {
   SleepWorkflowRunParams,
   SendSignalParams,
   SendSignalResult,
-  GetSignalDeliveryParams,
+  ConsumeSignalParams,
   toWorkflowRunCounts,
   resolveIdempotencyCutoff,
   type EnqueueScheduledRunsParams,
@@ -46,6 +46,7 @@ import { StepAttempt } from "../core/step-attempt.js";
 import { computeFailedWorkflowRunUpdate } from "../core/workflow-definition.js";
 import {
   resolveCancelWorkflowRunConflict,
+  validateSignalRecipient,
   WorkflowRun,
 } from "../core/workflow-run.js";
 import {
@@ -542,6 +543,17 @@ export class BackendSqlite implements Backend {
 
     this.db.exec("BEGIN IMMEDIATE");
     try {
+      const workflowRunId = params.workflowRunId ?? null;
+      if (workflowRunId !== null) {
+        const result = this.sendSignalToWorkflowRun(
+          workflowRunId,
+          params,
+          currentTime,
+        );
+        this.db.exec("COMMIT");
+        return Promise.resolve(result);
+      }
+
       if (params.idempotencyKey !== null) {
         const existingStmt = this.db.prepare(`
           SELECT DISTINCT "workflow_run_id"
@@ -647,22 +659,196 @@ export class BackendSqlite implements Backend {
     }
   }
 
-  getSignalDelivery(
-    params: GetSignalDeliveryParams,
+  /**
+   * Keep a signal for one workflow run until one of its waits takes it, and
+   * wake the run if it is waiting on the signal. Must run inside a transaction.
+   * @param workflowRunId - Workflow run the signal is addressed to
+   * @param params - Send params
+   * @param currentTime - Current timestamp
+   * @returns The addressed workflow run
+   */
+  private sendSignalToWorkflowRun(
+    workflowRunId: string,
+    params: SendSignalParams,
+    currentTime: string,
+  ): SendSignalResult {
+    const workflowRunStmt = this.db.prepare(`
+      SELECT "status"
+      FROM "workflow_runs"
+      WHERE "namespace_id" = ? AND "id" = ?
+    `);
+    // safety: backend transitions write domain status values.
+    const workflowRun = workflowRunStmt.get(this.namespaceId, workflowRunId) as
+      Pick<WorkflowRun, "status"> | null | undefined;
+
+    if (params.idempotencyKey !== null) {
+      const existingStmt = this.db.prepare(`
+        SELECT 1
+        FROM "workflow_signals"
+        WHERE "namespace_id" = ?
+          AND "signal" = ?
+          AND "sender_idempotency_key" = ?
+          AND "workflow_run_id" = ?
+        LIMIT 1
+      `);
+      const existing = existingStmt.get(
+        this.namespaceId,
+        params.signal,
+        params.idempotencyKey,
+        workflowRunId,
+      );
+      if (existing) {
+        return { workflowRunIds: [workflowRunId] };
+      }
+    }
+
+    validateSignalRecipient(workflowRunId, workflowRun ?? null);
+
+    const insertStmt = this.db.prepare(`
+      INSERT INTO "workflow_signals" (
+        "namespace_id", "id", "signal", "data",
+        "sender_idempotency_key", "workflow_run_id",
+        "created_at"
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `);
+    insertStmt.run(
+      this.namespaceId,
+      generateUUID(),
+      params.signal,
+      toJSON(params.data),
+      params.idempotencyKey,
+      workflowRunId,
+      currentTime,
+    );
+
+    // wake the workflow run if it is waiting on the signal
+    const wakeStmt = this.db.prepare(`
+      UPDATE "workflow_runs"
+      SET
+        "available_at" = CASE
+          WHEN "available_at" IS NULL OR "available_at" > ? THEN ?
+          ELSE "available_at"
+        END,
+        "updated_at" = ?
+      WHERE "namespace_id" = ?
+        AND "id" = ?
+        AND "worker_id" IS NULL
+        AND EXISTS (
+          SELECT 1
+          FROM "step_attempts" sa
+          WHERE sa."namespace_id" = "workflow_runs"."namespace_id"
+            AND sa."workflow_run_id" = "workflow_runs"."id"
+            AND sa."kind" = 'signal-wait'
+            AND sa."status" = 'running'
+            AND json_extract(sa."context", '$.signal') = ?
+        )
+    `);
+    wakeStmt.run(
+      currentTime,
+      currentTime,
+      currentTime,
+      this.namespaceId,
+      workflowRunId,
+      params.signal,
+    );
+
+    return { workflowRunIds: [workflowRunId] };
+  }
+
+  // oxlint-disable-next-line typescript/require-await -- keep the transaction synchronous
+  async consumeSignal(
+    params: ConsumeSignalParams,
   ): Promise<JsonValue | undefined> {
     const stmt = this.db.prepare(`
-      SELECT "data"
+      SELECT "data", "step_attempt_id"
       FROM "workflow_signals"
-      WHERE "namespace_id" = ? AND "step_attempt_id" = ?
+      WHERE "namespace_id" = ?
+        AND (
+          "step_attempt_id" = ?
+          OR (
+            "step_attempt_id" IS NULL
+            AND "workflow_run_id" = ?
+            AND "signal" = ?
+          )
+        )
+      ORDER BY "step_attempt_id" ASC NULLS LAST
       LIMIT 1
     `);
-    // safety: the query selects the nullable JSON text column from the signal delivery.
-    const row = stmt.get(this.namespaceId, params.stepAttemptId) as
-      { data: string | null } | null | undefined;
+    // safety: the query selects the nullable JSON text and step attempt columns from the signal.
+    const row = stmt.get(
+      this.namespaceId,
+      params.stepAttemptId,
+      params.workflowRunId,
+      params.signal,
+    ) as
+      | { data: string | null; step_attempt_id: string | null }
+      | null
+      | undefined;
 
-    // oxlint-disable-next-line unicorn/no-useless-undefined
-    if (!row) return Promise.resolve<JsonValue | undefined>(undefined);
-    return Promise.resolve(fromJSON(row.data));
+    if (!row) return undefined;
+    if (row.step_attempt_id !== null) return fromJSON(row.data);
+
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const ownedStmt = this.db.prepare(`
+        SELECT 1
+        FROM "workflow_runs"
+        WHERE ${RUNNING_WORKFLOW_RUN_OWNED_WHERE}
+      `);
+      requireRow(
+        ownedStmt.get(...this.runningWorkflowRunOwnedParams(params)),
+        "consume signal",
+      );
+
+      const deliveryStmt = this.db.prepare(`
+        SELECT "data"
+        FROM "workflow_signals"
+        WHERE "namespace_id" = ? AND "step_attempt_id" = ?
+        LIMIT 1
+      `);
+      // safety: the query selects the nullable JSON text column from the signal delivery.
+      const delivery = deliveryStmt.get(
+        this.namespaceId,
+        params.stepAttemptId,
+      ) as { data: string | null } | null | undefined;
+      if (delivery) {
+        this.db.exec("COMMIT");
+        return fromJSON(delivery.data);
+      }
+
+      // the oldest kept signal goes to the wait
+      const takeStmt = this.db.prepare(`
+        UPDATE "workflow_signals"
+        SET "step_attempt_id" = ?
+        WHERE "namespace_id" = ?
+          AND "id" = (
+            SELECT "id"
+            FROM "workflow_signals"
+            WHERE "namespace_id" = ?
+              AND "workflow_run_id" = ?
+              AND "signal" = ?
+              AND "step_attempt_id" IS NULL
+            ORDER BY "created_at" ASC, rowid ASC
+            LIMIT 1
+          )
+        RETURNING "data"
+      `);
+      // safety: the query returns the nullable JSON text column from the signal.
+      const taken = takeStmt.get(
+        params.stepAttemptId,
+        this.namespaceId,
+        this.namespaceId,
+        params.workflowRunId,
+        params.signal,
+      ) as { data: string | null } | null | undefined;
+
+      this.db.exec("COMMIT");
+      return taken ? fromJSON(taken.data) : undefined;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   async claimWorkflowRun(
@@ -840,6 +1026,19 @@ export class BackendSqlite implements Backend {
               JOIN "workflow_signals" ws
                 ON ws."namespace_id" = sa."namespace_id"
                 AND ws."step_attempt_id" = sa."id"
+              WHERE sa."namespace_id" = "workflow_runs"."namespace_id"
+              AND sa."workflow_run_id" = "workflow_runs"."id"
+              AND sa."kind" = 'signal-wait'
+              AND sa."status" = 'running'
+            )
+            OR EXISTS (
+              SELECT 1
+              FROM "step_attempts" sa
+              JOIN "workflow_signals" ws
+                ON ws."namespace_id" = sa."namespace_id"
+                AND ws."workflow_run_id" = sa."workflow_run_id"
+                AND ws."signal" = json_extract(sa."context", '$.signal')
+                AND ws."step_attempt_id" IS NULL
               WHERE sa."namespace_id" = "workflow_runs"."namespace_id"
               AND sa."workflow_run_id" = "workflow_runs"."id"
               AND sa."kind" = 'signal-wait'

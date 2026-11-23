@@ -336,6 +336,31 @@ export function migrations(schema: string): string[] {
     ON CONFLICT DO NOTHING;
 
     COMMIT;`,
+
+    // 9 - signals addressed to one workflow run
+    `BEGIN;
+
+    ALTER TABLE ${quotedSchema}."workflow_signals"
+
+    -- released versions read this column only by equality, so they never see a row where it is null
+    -- squawk-ignore ban-drop-not-null
+    ALTER COLUMN "step_attempt_id" DROP NOT NULL;
+
+    COMMIT;
+
+    -- statement-breakpoint
+    CREATE INDEX CONCURRENTLY IF NOT EXISTS "workflow_signals_pending_idx"
+    ON ${quotedSchema}."workflow_signals" ("namespace_id", "workflow_run_id", "signal", "created_at", "id")
+    WHERE "step_attempt_id" IS NULL;
+
+    -- statement-breakpoint
+    BEGIN;
+
+    INSERT INTO ${quotedSchema}."openworkflow_migrations"("version")
+    VALUES (9)
+    ON CONFLICT DO NOTHING;
+
+    COMMIT;`,
   ];
 }
 

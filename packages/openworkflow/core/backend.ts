@@ -96,8 +96,8 @@ export interface Backend {
 
   // Signals
   sendSignal(params: Readonly<SendSignalParams>): Promise<SendSignalResult>;
-  getSignalDelivery(
-    params: Readonly<GetSignalDeliveryParams>,
+  consumeSignal(
+    params: Readonly<ConsumeSignalParams>,
   ): Promise<JsonValue | undefined>;
 
   // Lifecycle
@@ -230,14 +230,18 @@ export interface SendSignalParams {
   signal: string;
   data: JsonValue | null;
   idempotencyKey: string | null;
+  workflowRunId?: string | null; // omitted or null = every waiting run
 }
 
 export interface SendSignalResult {
   workflowRunIds: string[];
 }
 
-export interface GetSignalDeliveryParams {
+export interface ConsumeSignalParams {
+  workflowRunId: string;
   stepAttemptId: string;
+  workerId: string;
+  signal: string;
 }
 
 export interface PaginationOptions {

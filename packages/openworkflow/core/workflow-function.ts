@@ -92,6 +92,7 @@ export interface StepApi {
       name?: string;
       signal: string;
       data?: JsonValue;
+      workflowRunId?: string;
     }>,
   ) => Promise<{ workflowRunIds: string[] }>;
   waitForSignal: <Output>(

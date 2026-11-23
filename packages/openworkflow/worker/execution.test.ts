@@ -4142,6 +4142,174 @@ describe("StepExecutor", () => {
     expect(sendSignalSpy).toHaveBeenCalledTimes(1);
     sendSignalSpy.mockRestore();
   });
+
+  test("sendSignal with workflowRunId sends to that workflow run only", async () => {
+    const backend = await createTestBackend();
+    const client = new OpenWorkflow({ backend });
+    const signalString = `addressed-signal-${randomUUID()}`;
+
+    const waiter = client.defineWorkflow(
+      { name: `addressed-waiter-${randomUUID()}` },
+      async ({ step }) => {
+        return await step.waitForSignal({
+          signal: signalString,
+          timeout: 30_000,
+        });
+      },
+    );
+
+    const sender = client.defineWorkflow<{ workflowRunId: string }, unknown>(
+      { name: `addressed-sender-${randomUUID()}` },
+      async ({ input, step }) => {
+        return await step.sendSignal({
+          signal: signalString,
+          data: { approved: true },
+          workflowRunId: input.workflowRunId,
+        });
+      },
+    );
+
+    const worker = client.newWorker({ concurrency: 2 });
+
+    const waiterHandle = await waiter.run();
+    const otherHandle = await waiter.run();
+    await tickUntilParked(backend, worker, waiterHandle.workflowRun.id, 20, 50);
+    await tickUntilParked(backend, worker, otherHandle.workflowRun.id, 20, 50);
+
+    const senderHandle = await sender.run({
+      workflowRunId: waiterHandle.workflowRun.id,
+    });
+    const senderStatus = await tickUntilTerminal(
+      backend,
+      worker,
+      senderHandle.workflowRun.id,
+      20,
+      50,
+    );
+    expect(senderStatus).toBe("completed");
+    await expect(senderHandle.result()).resolves.toEqual({
+      workflowRunIds: [waiterHandle.workflowRun.id],
+    });
+
+    const waiterStatus = await tickUntilTerminal(
+      backend,
+      worker,
+      waiterHandle.workflowRun.id,
+      20,
+      50,
+    );
+    expect(waiterStatus).toBe("completed");
+    await expect(waiterHandle.result()).resolves.toEqual({
+      data: { approved: true },
+    });
+
+    const other = await backend.getWorkflowRun({
+      workflowRunId: otherHandle.workflowRun.id,
+    });
+    expect(other?.status).toBe("running");
+    expect(other?.workerId).toBeNull();
+  });
+
+  test("waitForSignal takes a signal sent to its workflow run before it waits", async () => {
+    const backend = await createTestBackend();
+    const client = new OpenWorkflow({ backend });
+    const signalString = `kept-signal-${randomUUID()}`;
+
+    const workflow = client.defineWorkflow(
+      { name: `kept-signal-waiter-${randomUUID()}` },
+      async ({ step }) => {
+        return await step.waitForSignal({
+          signal: signalString,
+          timeout: 30_000,
+        });
+      },
+    );
+
+    const worker = client.newWorker();
+    const handle = await workflow.run();
+
+    const sent = await client.sendSignal({
+      signal: signalString,
+      data: { approved: true },
+      workflowRunId: handle.workflowRun.id,
+    });
+    expect(sent).toEqual({ workflowRunIds: [handle.workflowRun.id] });
+
+    const status = await tickUntilTerminal(
+      backend,
+      worker,
+      handle.workflowRun.id,
+      20,
+      50,
+    );
+    expect(status).toBe("completed");
+    await expect(handle.result()).resolves.toEqual({
+      data: { approved: true },
+    });
+  });
+
+  test("waitForSignal takes a kept signal after its timeout", async () => {
+    const backend = await createTestBackend();
+    const client = new OpenWorkflow({ backend });
+    const signalString = `kept-after-timeout-${randomUUID()}`;
+
+    const workflow = client.defineWorkflow(
+      { name: `kept-after-timeout-${randomUUID()}` },
+      async ({ step }) => {
+        return await step.waitForSignal({ signal: signalString, timeout: 0 });
+      },
+    );
+
+    const worker = client.newWorker();
+    const handle = await workflow.run();
+    await client.sendSignal({
+      signal: signalString,
+      data: { approved: true },
+      workflowRunId: handle.workflowRun.id,
+    });
+
+    const status = await tickUntilTerminal(
+      backend,
+      worker,
+      handle.workflowRun.id,
+      20,
+      50,
+    );
+    expect(status).toBe("completed");
+    await expect(handle.result()).resolves.toEqual({
+      data: { approved: true },
+    });
+  });
+
+  test("sendSignal step fails when the addressed workflow run does not exist", async () => {
+    const backend = await createTestBackend();
+    const client = new OpenWorkflow({ backend });
+    const workflowRunId = randomUUID();
+
+    const workflow = client.defineWorkflow(
+      { name: `signal-send-missing-run-${randomUUID()}` },
+      async ({ step }) => {
+        return await step.sendSignal({
+          signal: "missing-run",
+          workflowRunId,
+        });
+      },
+    );
+
+    const worker = client.newWorker();
+    const handle = await workflow.run();
+    const status = await tickUntilTerminal(
+      backend,
+      worker,
+      handle.workflowRun.id,
+      20,
+      50,
+    );
+    expect(status).toBe("failed");
+    await expect(handle.result()).rejects.toThrow(
+      `Workflow run ${workflowRunId} does not exist`,
+    );
+  });
 });
 
 describe("executeWorkflow", () => {
@@ -5100,6 +5268,7 @@ describe("executeWorkflow", () => {
         signal: "notify",
         data: { v: 1 },
         idempotencyKey: "__signal:signal-send-resume-run:notify",
+        workflowRunId: null,
       });
       expect(completeStepAttempt).toHaveBeenCalledWith(
         expect.objectContaining({ stepAttemptId: "running-signal-send" }),

@@ -1656,6 +1656,54 @@ export function testBackend(options: TestBackendOptions): void {
         await teardown(backend);
       });
 
+      test("wakes a parked run when a kept signal arrives before parking", async () => {
+        const backend = await setup();
+
+        const run = await createClaimedWorkflowRun(backend);
+        const workerId = run.workerId ?? "";
+        const signalString = `reconcile-kept-${randomUUID()}`;
+
+        await backend.createStepAttempt({
+          workflowRunId: run.id,
+          workerId,
+          stepName: "wait-step",
+          kind: "signal-wait",
+          config: {},
+          context: {
+            kind: "signal-wait",
+            signal: signalString,
+            timeoutAt: newDateInOneYear().toISOString(),
+          },
+        });
+
+        await backend.sendSignal({
+          signal: signalString,
+          data: { value: "arrived-early" },
+          idempotencyKey: null,
+          workflowRunId: run.id,
+        });
+
+        const farFuture = new Date(Date.now() + 5 * 60 * 1000);
+        await backend.sleepWorkflowRun({
+          workflowRunId: run.id,
+          workerId,
+          availableAt: farFuture,
+        });
+
+        const runAfter = await backend.getWorkflowRun({
+          workflowRunId: run.id,
+        });
+        expect(runAfter?.workerId).toBeNull();
+        if (!runAfter?.availableAt) {
+          throw new Error("Expected availableAt after signal reconciliation");
+        }
+        expect(runAfter.availableAt.getTime()).toBeLessThanOrEqual(
+          Date.now() + 5000,
+        );
+
+        await teardown(backend);
+      });
+
       test("does not wake a running parent run when a child run completes", async () => {
         const backend = await setup();
 
@@ -2949,7 +2997,12 @@ export function testBackend(options: TestBackendOptions): void {
               activeHandle ? [activeHandle.workflowRun.id] : [],
             );
             await expect(
-              isolatedBackend.getSignalDelivery({ stepAttemptId: waitStep.id }),
+              isolatedBackend.consumeSignal({
+                workflowRunId: waitStep.workflowRunId,
+                stepAttemptId: waitStep.id,
+                workerId: randomUUID(),
+                signal,
+              }),
             ).resolves.toBeUndefined();
 
             await worker.tick();
@@ -3007,8 +3060,11 @@ export function testBackend(options: TestBackendOptions): void {
 
         expect(result.workflowRunIds).toContain(run.id);
 
-        const delivered = await backend.getSignalDelivery({
+        const delivered = await backend.consumeSignal({
+          workflowRunId: run.id,
           stepAttemptId: step.id,
+          workerId: run.workerId!, // oxlint-disable-line typescript/no-non-null-assertion
+          signal: signalString,
         });
         expect(delivered).toEqual({ approved: true });
 
@@ -3138,8 +3194,11 @@ export function testBackend(options: TestBackendOptions): void {
         });
 
         // only the first delivery should be stored
-        const delivered = await backend.getSignalDelivery({
+        const delivered = await backend.consumeSignal({
+          workflowRunId: run.id,
           stepAttemptId: step.id,
+          workerId: run.workerId!, // oxlint-disable-line typescript/no-non-null-assertion
+          signal: signalString,
         });
         expect(delivered).toEqual({ first: true });
       });
@@ -3181,15 +3240,236 @@ export function testBackend(options: TestBackendOptions): void {
         });
 
         // should still return the original delivery, not the duplicate
-        const delivered = await backend.getSignalDelivery({
+        const delivered = await backend.consumeSignal({
+          workflowRunId: run.id,
           stepAttemptId: step.id,
+          workerId: run.workerId!, // oxlint-disable-line typescript/no-non-null-assertion
+          signal: signalString,
         });
         expect(delivered).toEqual({ original: true });
       });
-    });
 
-    describe("getSignalDelivery()", () => {
-      test("returns undefined when no delivery exists", async () => {
+      test("keeps a signal for one workflow run until a wait takes it", async () => {
+        const run = await createClaimedWorkflowRun(backend);
+        const signalString = `kept-${randomUUID()}`;
+
+        const result = await backend.sendSignal({
+          signal: signalString,
+          data: { approved: true },
+          idempotencyKey: null,
+          workflowRunId: run.id,
+        });
+        expect(result.workflowRunIds).toEqual([run.id]);
+
+        const step = await backend.createStepAttempt({
+          workflowRunId: run.id,
+          workerId: run.workerId!, // oxlint-disable-line typescript/no-non-null-assertion
+          stepName: "wait-step",
+          kind: "signal-wait",
+          config: {},
+          context: {
+            kind: "signal-wait",
+            signal: signalString,
+            timeoutAt: newDateInOneYear().toISOString(),
+          },
+        });
+
+        await expect(
+          backend.consumeSignal({
+            workflowRunId: run.id,
+            stepAttemptId: step.id,
+            workerId: run.workerId!, // oxlint-disable-line typescript/no-non-null-assertion
+            signal: signalString,
+          }),
+        ).resolves.toEqual({ approved: true });
+      });
+
+      test("wakes only the addressed workflow run", async () => {
+        const signalString = `addressed-${randomUUID()}`;
+        const runs: WorkflowRun[] = [];
+
+        for (let i = 0; i < 2; i++) {
+          const run = await createClaimedWorkflowRun(backend);
+          await backend.createStepAttempt({
+            workflowRunId: run.id,
+            workerId: run.workerId!, // oxlint-disable-line typescript/no-non-null-assertion
+            stepName: "wait-step",
+            kind: "signal-wait",
+            config: {},
+            context: {
+              kind: "signal-wait",
+              signal: signalString,
+              timeoutAt: newDateInOneYear().toISOString(),
+            },
+          });
+          await backend.sleepWorkflowRun({
+            workflowRunId: run.id,
+            workerId: run.workerId!, // oxlint-disable-line typescript/no-non-null-assertion
+            availableAt: newDateInOneYear(),
+          });
+          runs.push(run);
+        }
+        const [addressed, other] = runs;
+        if (!addressed || !other) throw new Error("Expected two waiting runs");
+
+        const result = await backend.sendSignal({
+          signal: signalString,
+          data: { approved: true },
+          idempotencyKey: null,
+          workflowRunId: addressed.id,
+        });
+        expect(result.workflowRunIds).toEqual([addressed.id]);
+
+        const wokenRun = await backend.getWorkflowRun({
+          workflowRunId: addressed.id,
+        });
+        // oxlint-disable-next-line typescript/no-non-null-assertion
+        expect(wokenRun!.availableAt!.getTime()).toBeLessThanOrEqual(
+          Date.now() + 5000,
+        );
+        const otherRun = await backend.getWorkflowRun({
+          workflowRunId: other.id,
+        });
+        // oxlint-disable-next-line typescript/no-non-null-assertion
+        expect(otherRun!.availableAt!.getTime()).toBeGreaterThan(
+          Date.now() + 5000,
+        );
+      });
+
+      test("does not wake a workflow run that is not waiting on the signal", async () => {
+        const run = await createPendingWorkflowRun(backend, {
+          availableAt: newDateInOneYear(),
+        });
+
+        await backend.sendSignal({
+          signal: `not-waiting-${randomUUID()}`,
+          data: null,
+          idempotencyKey: null,
+          workflowRunId: run.id,
+        });
+
+        const runAfter = await backend.getWorkflowRun({
+          workflowRunId: run.id,
+        });
+        expect(runAfter?.status).toBe("pending");
+        expect(runAfter?.availableAt).toEqual(run.availableAt);
+      });
+
+      test("throws when the addressed workflow run does not exist", async () => {
+        const workflowRunId = randomUUID();
+
+        await expect(async () =>
+          backend.sendSignal({
+            signal: `missing-run-${randomUUID()}`,
+            data: null,
+            idempotencyKey: null,
+            workflowRunId,
+          }),
+        ).rejects.toThrow(`Workflow run ${workflowRunId} does not exist`);
+      });
+
+      test("throws when the addressed workflow run has finished", async () => {
+        const run = await createPendingWorkflowRun(backend, {
+          availableAt: newDateInOneYear(),
+        });
+        await backend.cancelWorkflowRun({ workflowRunId: run.id });
+
+        await expect(async () =>
+          backend.sendSignal({
+            signal: `finished-run-${randomUUID()}`,
+            data: null,
+            idempotencyKey: null,
+            workflowRunId: run.id,
+          }),
+        ).rejects.toThrow(
+          `Cannot send signal to workflow run ${run.id} with status canceled`,
+        );
+      });
+
+      test("idempotent send to one workflow run is kept once", async () => {
+        const run = await createClaimedWorkflowRun(backend);
+        const signalString = `idempotent-addressed-${randomUUID()}`;
+        const idempotencyKey = randomUUID();
+
+        const first = await backend.sendSignal({
+          signal: signalString,
+          data: { val: 1 },
+          idempotencyKey,
+          workflowRunId: run.id,
+        });
+        const second = await backend.sendSignal({
+          signal: signalString,
+          data: { val: 2 },
+          idempotencyKey,
+          workflowRunId: run.id,
+        });
+        expect(second).toEqual(first);
+
+        const step = await backend.createStepAttempt({
+          workflowRunId: run.id,
+          workerId: run.workerId!, // oxlint-disable-line typescript/no-non-null-assertion
+          stepName: "wait-step",
+          kind: "signal-wait",
+          config: {},
+          context: {
+            kind: "signal-wait",
+            signal: signalString,
+            timeoutAt: newDateInOneYear().toISOString(),
+          },
+        });
+        await expect(
+          backend.consumeSignal({
+            workflowRunId: run.id,
+            stepAttemptId: step.id,
+            workerId: run.workerId!, // oxlint-disable-line typescript/no-non-null-assertion
+            signal: signalString,
+          }),
+        ).resolves.toEqual({ val: 1 });
+        await backend.completeStepAttempt({
+          workflowRunId: run.id,
+          stepAttemptId: step.id,
+          workerId: run.workerId!, // oxlint-disable-line typescript/no-non-null-assertion
+          output: null,
+        });
+
+        const nextStep = await backend.createStepAttempt({
+          workflowRunId: run.id,
+          workerId: run.workerId!, // oxlint-disable-line typescript/no-non-null-assertion
+          stepName: "next-wait-step",
+          kind: "signal-wait",
+          config: {},
+          context: {
+            kind: "signal-wait",
+            signal: signalString,
+            timeoutAt: newDateInOneYear().toISOString(),
+          },
+        });
+        await expect(
+          backend.consumeSignal({
+            workflowRunId: run.id,
+            stepAttemptId: nextStep.id,
+            workerId: run.workerId!, // oxlint-disable-line typescript/no-non-null-assertion
+            signal: signalString,
+          }),
+        ).resolves.toBeUndefined();
+
+        // a repeat names the run even after it has finished
+        await backend.cancelWorkflowRun({ workflowRunId: run.id });
+        const third = await backend.sendSignal({
+          signal: signalString,
+          data: { val: 3 },
+          idempotencyKey,
+          workflowRunId: run.id,
+        });
+        expect(third).toEqual(first);
+      });
+
+      test("idempotent send to all waiters returns the run an addressed send reached", async () => {
+        const signalString = `idempotent-mixed-${randomUUID()}`;
+        const idempotencyKey = randomUUID();
+        const addressed = await createPendingWorkflowRun(backend, {
+          availableAt: newDateInOneYear(),
+        });
         const run = await createClaimedWorkflowRun(backend);
         const step = await backend.createStepAttempt({
           workflowRunId: run.id,
@@ -3199,13 +3479,63 @@ export function testBackend(options: TestBackendOptions): void {
           config: {},
           context: {
             kind: "signal-wait",
-            signal: `no-delivery-${randomUUID()}`,
+            signal: signalString,
+            timeoutAt: newDateInOneYear().toISOString(),
+          },
+        });
+        await backend.sleepWorkflowRun({
+          workflowRunId: run.id,
+          workerId: run.workerId!, // oxlint-disable-line typescript/no-non-null-assertion
+          availableAt: newDateInOneYear(),
+        });
+
+        await backend.sendSignal({
+          signal: signalString,
+          data: { val: 1 },
+          idempotencyKey,
+          workflowRunId: addressed.id,
+        });
+        const result = await backend.sendSignal({
+          signal: signalString,
+          data: { val: 2 },
+          idempotencyKey,
+        });
+
+        expect(result.workflowRunIds).toEqual([addressed.id]);
+        await expect(
+          backend.consumeSignal({
+            workflowRunId: run.id,
+            stepAttemptId: step.id,
+            workerId: run.workerId!, // oxlint-disable-line typescript/no-non-null-assertion
+            signal: signalString,
+          }),
+        ).resolves.toBeUndefined();
+      });
+    });
+
+    describe("consumeSignal()", () => {
+      test("returns undefined when no delivery exists", async () => {
+        const run = await createClaimedWorkflowRun(backend);
+        const signalString = `no-delivery-${randomUUID()}`;
+
+        const step = await backend.createStepAttempt({
+          workflowRunId: run.id,
+          workerId: run.workerId!, // oxlint-disable-line typescript/no-non-null-assertion
+          stepName: "wait-step",
+          kind: "signal-wait",
+          config: {},
+          context: {
+            kind: "signal-wait",
+            signal: signalString,
             timeoutAt: newDateInOneYear().toISOString(),
           },
         });
 
-        const result = await backend.getSignalDelivery({
+        const result = await backend.consumeSignal({
+          workflowRunId: run.id,
           stepAttemptId: step.id,
+          workerId: run.workerId!, // oxlint-disable-line typescript/no-non-null-assertion
+          signal: signalString,
         });
         expect(result).toBeUndefined();
       });
@@ -3244,10 +3574,181 @@ export function testBackend(options: TestBackendOptions): void {
         const step = steps.data.find((s) => s.stepName === "wait-step");
         expect(step).toBeDefined();
 
-        const result = await backend.getSignalDelivery({
+        const result = await backend.consumeSignal({
+          workflowRunId: run.id,
           stepAttemptId: step!.id, // oxlint-disable-line typescript/no-non-null-assertion
+          workerId: run.workerId!, // oxlint-disable-line typescript/no-non-null-assertion
+          signal: signalString,
         });
         expect(result).toBeNull();
+      });
+
+      test("takes kept signals oldest first and keeps each with its wait", async () => {
+        const run = await createClaimedWorkflowRun(backend);
+        const signalString = `oldest-first-${randomUUID()}`;
+
+        for (const n of [1, 2]) {
+          await backend.sendSignal({
+            signal: signalString,
+            data: { n },
+            idempotencyKey: null,
+            workflowRunId: run.id,
+          });
+        }
+
+        const step = await backend.createStepAttempt({
+          workflowRunId: run.id,
+          workerId: run.workerId!, // oxlint-disable-line typescript/no-non-null-assertion
+          stepName: "wait-step",
+          kind: "signal-wait",
+          config: {},
+          context: {
+            kind: "signal-wait",
+            signal: signalString,
+            timeoutAt: newDateInOneYear().toISOString(),
+          },
+        });
+        await expect(
+          backend.consumeSignal({
+            workflowRunId: run.id,
+            stepAttemptId: step.id,
+            workerId: run.workerId!, // oxlint-disable-line typescript/no-non-null-assertion
+            signal: signalString,
+          }),
+        ).resolves.toEqual({ n: 1 });
+        await expect(
+          backend.consumeSignal({
+            workflowRunId: run.id,
+            stepAttemptId: step.id,
+            workerId: run.workerId!, // oxlint-disable-line typescript/no-non-null-assertion
+            signal: signalString,
+          }),
+        ).resolves.toEqual({ n: 1 });
+        await backend.completeStepAttempt({
+          workflowRunId: run.id,
+          stepAttemptId: step.id,
+          workerId: run.workerId!, // oxlint-disable-line typescript/no-non-null-assertion
+          output: null,
+        });
+
+        const nextStep = await backend.createStepAttempt({
+          workflowRunId: run.id,
+          workerId: run.workerId!, // oxlint-disable-line typescript/no-non-null-assertion
+          stepName: "next-wait-step",
+          kind: "signal-wait",
+          config: {},
+          context: {
+            kind: "signal-wait",
+            signal: signalString,
+            timeoutAt: newDateInOneYear().toISOString(),
+          },
+        });
+        await expect(
+          backend.consumeSignal({
+            workflowRunId: run.id,
+            stepAttemptId: nextStep.id,
+            workerId: run.workerId!, // oxlint-disable-line typescript/no-non-null-assertion
+            signal: signalString,
+          }),
+        ).resolves.toEqual({ n: 2 });
+      });
+
+      test("returns a delivery before a kept signal", async () => {
+        const run = await createClaimedWorkflowRun(backend);
+        const signalString = `delivery-first-${randomUUID()}`;
+
+        const step = await backend.createStepAttempt({
+          workflowRunId: run.id,
+          workerId: run.workerId!, // oxlint-disable-line typescript/no-non-null-assertion
+          stepName: "wait-step",
+          kind: "signal-wait",
+          config: {},
+          context: {
+            kind: "signal-wait",
+            signal: signalString,
+            timeoutAt: newDateInOneYear().toISOString(),
+          },
+        });
+        await backend.sendSignal({
+          signal: signalString,
+          data: { to: "run" },
+          idempotencyKey: null,
+          workflowRunId: run.id,
+        });
+        await backend.sendSignal({
+          signal: signalString,
+          data: { to: "waiters" },
+          idempotencyKey: null,
+        });
+
+        await expect(
+          backend.consumeSignal({
+            workflowRunId: run.id,
+            stepAttemptId: step.id,
+            workerId: run.workerId!, // oxlint-disable-line typescript/no-non-null-assertion
+            signal: signalString,
+          }),
+        ).resolves.toEqual({ to: "waiters" });
+        await backend.completeStepAttempt({
+          workflowRunId: run.id,
+          stepAttemptId: step.id,
+          workerId: run.workerId!, // oxlint-disable-line typescript/no-non-null-assertion
+          output: null,
+        });
+
+        const nextStep = await backend.createStepAttempt({
+          workflowRunId: run.id,
+          workerId: run.workerId!, // oxlint-disable-line typescript/no-non-null-assertion
+          stepName: "next-wait-step",
+          kind: "signal-wait",
+          config: {},
+          context: {
+            kind: "signal-wait",
+            signal: signalString,
+            timeoutAt: newDateInOneYear().toISOString(),
+          },
+        });
+        await expect(
+          backend.consumeSignal({
+            workflowRunId: run.id,
+            stepAttemptId: nextStep.id,
+            workerId: run.workerId!, // oxlint-disable-line typescript/no-non-null-assertion
+            signal: signalString,
+          }),
+        ).resolves.toEqual({ to: "run" });
+      });
+
+      test("fails to take a kept signal when the worker does not own the run", async () => {
+        const run = await createClaimedWorkflowRun(backend);
+        const signalString = `not-owned-${randomUUID()}`;
+
+        const step = await backend.createStepAttempt({
+          workflowRunId: run.id,
+          workerId: run.workerId!, // oxlint-disable-line typescript/no-non-null-assertion
+          stepName: "wait-step",
+          kind: "signal-wait",
+          config: {},
+          context: {
+            kind: "signal-wait",
+            signal: signalString,
+            timeoutAt: newDateInOneYear().toISOString(),
+          },
+        });
+        await backend.sendSignal({
+          signal: signalString,
+          data: null,
+          idempotencyKey: null,
+          workflowRunId: run.id,
+        });
+
+        await expect(
+          backend.consumeSignal({
+            workflowRunId: run.id,
+            stepAttemptId: step.id,
+            workerId: randomUUID(),
+            signal: signalString,
+          }),
+        ).rejects.toThrow("Failed to consume signal");
       });
     });
   });

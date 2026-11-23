@@ -328,7 +328,12 @@ describe.each(["sqlite", "postgres"])("reruns (%s)", (database) => {
     const savedWait = copied[0];
     assert.ok(savedWait);
     await expect(
-      backend.getSignalDelivery({ stepAttemptId: savedWait.id }),
+      backend.consumeSignal({
+        workflowRunId: rerun.id,
+        stepAttemptId: savedWait.id,
+        workerId: "",
+        signal: "reply",
+      }),
     ).resolves.toBeUndefined();
     if (backend instanceof BackendSqlite) {
       backend["db"]
@@ -342,7 +347,7 @@ describe.each(["sqlite", "postgres"])("reruns (%s)", (database) => {
       await pg`DELETE FROM ${backend["workflowSignalsTable"]()} WHERE "workflow_run_id" = ${original.workflowRun.id}`;
       await pg`DELETE FROM ${backend["workflowRunsTable"]()} WHERE "id" = ${original.workflowRun.id}`;
     }
-    const deliveries = vi.spyOn(backend, "getSignalDelivery");
+    const deliveries = vi.spyOn(backend, "consumeSignal");
     await expect(finish(rerun.id)).resolves.toMatchObject({
       status: "completed",
       output: { data: { value: 42 } },

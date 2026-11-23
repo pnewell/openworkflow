@@ -42,7 +42,9 @@ durable execution with minimal operational complexity.
   the workflow is woken. If no workflow is waiting at send time, the signal
   has no effect and no delivery row is persisted. A retry with the same
   idempotency key may therefore deliver to workflows that began waiting after
-  the original attempt.
+  the original attempt. A signal sent to one workflow run is instead written to
+  `workflow_signals` for that run and kept until one of the run's waits on that
+  signal name takes it.
 - **`availableAt`**: A critical timestamp on a workflow run that controls its
   visibility to workers. It is used for scheduling, heartbeating, crash
   recovery, and durable timers.
@@ -133,7 +135,8 @@ of coordination. There is no separate orchestrator server.
   The `workflow_runs` table serves as the job queue for the workers, the
   `step_attempts` table serves as a record of started and completed work
   enabling memoization, and the `workflow_signals` table records signal
-  deliveries so a waking workflow can read the payload.
+  deliveries and signals kept for a run so a waking workflow can read the
+  payload.
 
 ### 2.3. Basic Execution Flow
 
@@ -253,7 +256,9 @@ workflow.
 
 **`step.sendSignal(options)`**: Sends a named signal to all workflows currently
 waiting on it. The send is recorded as a step attempt so it won't repeat on
-replay. If no workflow is waiting, the signal is silently dropped.
+replay. If no workflow is waiting, the signal is silently dropped. With
+`workflowRunId`, the signal is sent to that workflow run only and kept until
+one of its waits takes it.
 
 ```ts
 await step.sendSignal({
@@ -265,7 +270,8 @@ await step.sendSignal({
 **`step.waitForSignal(options)`**: Parks the workflow until a matching signal
 arrives or the timeout expires. When a signal is sent targeting this signal
 name, a delivery row is written to `workflow_signals` and the workflow is woken.
-Returns `{ data }` on delivery, or `null` on timeout.
+A signal kept for the run under this signal name is taken by the wait, oldest
+first. Returns `{ data }` on delivery, or `null` on timeout.
 
 ```ts
 const result = await step.waitForSignal({

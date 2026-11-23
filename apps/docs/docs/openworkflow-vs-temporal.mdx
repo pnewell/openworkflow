@@ -43,8 +43,9 @@ Elasticsearch is not required.
   languages.
 - **Queries and Updates**: You need to read workflow state or submit changes
   and await a response. OpenWorkflow has [Signals](/docs/signals), but no
-  equivalent Query or Update APIs. Its signals only reach workflows already
-  waiting for them; they aren't buffered.
+  equivalent Query or Update APIs. Signals sent by name only reach workflows
+  already waiting for them; only a signal sent to one workflow run is kept
+  until it is received.
 - **Long-running Activities**: You need Activity heartbeats to save progress
   for the next attempt. OpenWorkflow's worker heartbeats renew run leases;
   they don't save progress inside a `step.run` function.

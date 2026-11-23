@@ -208,6 +208,46 @@ describe("sqlite", () => {
       expect(getMigrationVersion(db)).toBe(migrations().length - 1);
     });
 
+    test("keeps workflow signals and their indexes when rebuilding the table", () => {
+      for (const sql of migrations().slice(0, 9)) db.exec(sql);
+      db.exec(`
+        INSERT INTO "workflow_signals" (
+          "namespace_id", "id", "signal", "data",
+          "sender_idempotency_key", "workflow_run_id",
+          "step_attempt_id", "created_at"
+        )
+        VALUES ('ns', 'id', 'signal', '1', 'key', 'run', 'step', 'now')
+      `);
+
+      migrate(db);
+
+      expect(db.prepare('SELECT * FROM "workflow_signals"').all()).toEqual([
+        {
+          namespace_id: "ns",
+          id: "id",
+          signal: "signal",
+          data: "1",
+          sender_idempotency_key: "key",
+          workflow_run_id: "run",
+          step_attempt_id: "step",
+          created_at: "now",
+        },
+      ]);
+      expect(
+        db
+          .prepare(
+            `SELECT name FROM sqlite_master
+             WHERE type = 'index' AND tbl_name = 'workflow_signals' AND sql IS NOT NULL
+             ORDER BY name`,
+          )
+          .all(),
+      ).toEqual([
+        { name: "workflow_signals_idempotency_idx" },
+        { name: "workflow_signals_pending_idx" },
+        { name: "workflow_signals_step_attempt_idx" },
+      ]);
+    });
+
     test.each(["pending", "current"])(
       "coordinates %s migrations across processes",
       async (state) => {

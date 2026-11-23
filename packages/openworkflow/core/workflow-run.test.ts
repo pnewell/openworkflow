@@ -4,6 +4,7 @@ import {
   resolveCancelWorkflowRunConflict,
   validateConcurrencyKey,
   validateInput,
+  validateSignalRecipient,
 } from "./workflow-run.js";
 import type { WorkflowRun, WorkflowRunStatus } from "./workflow-run.js";
 import { describe, expect, test } from "vitest";
@@ -229,6 +230,34 @@ function createMockSchema<I, O = I>(options: {
     },
   };
 }
+
+describe("validateSignalRecipient", () => {
+  test("throws when existing run is null", () => {
+    expect(() => {
+      validateSignalRecipient("wr-1", null);
+    }).toThrow("Workflow run wr-1 does not exist");
+  });
+
+  test.each<WorkflowRunStatus>(["pending", "running", "sleeping"])(
+    "accepts a run that has not finished (%s)",
+    (status) => {
+      expect(() => {
+        validateSignalRecipient("wr-1", { status });
+      }).not.toThrow();
+    },
+  );
+
+  test.each<WorkflowRunStatus>([
+    "succeeded",
+    "completed",
+    "failed",
+    "canceled",
+  ])("throws when existing status is terminal (%s)", (status) => {
+    expect(() => {
+      validateSignalRecipient("wr-1", { status });
+    }).toThrow(`Cannot send signal to workflow run wr-1 with status ${status}`);
+  });
+});
 
 describe("validateConcurrencyKey", () => {
   test("accepts a nonempty key or no key", () => {

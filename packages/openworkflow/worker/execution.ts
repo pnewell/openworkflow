@@ -977,6 +977,7 @@ class StepExecutor implements StepApi {
       name?: string;
       signal: string;
       data?: JsonValue;
+      workflowRunId?: string;
     }>,
   ): Promise<{ workflowRunIds: string[] }> {
     const stepName = this.history.resolveStepName(
@@ -1008,7 +1009,11 @@ class StepExecutor implements StepApi {
   private async resolveSignalSend(
     stepName: string,
     attempt: Readonly<StepAttempt>,
-    options: Readonly<{ signal: string; data?: JsonValue }>,
+    options: Readonly<{
+      signal: string;
+      data?: JsonValue;
+      workflowRunId?: string;
+    }>,
   ): Promise<{ workflowRunIds: string[] }> {
     try {
       const result = await traceOperation(
@@ -1028,6 +1033,7 @@ class StepExecutor implements StepApi {
               this.workflowRunId,
               stepName,
             ),
+            workflowRunId: options.workflowRunId ?? null,
           });
           setAttribute(
             span,
@@ -1108,11 +1114,15 @@ class StepExecutor implements StepApi {
     stepName: string,
     attempt: Readonly<StepAttempt>,
     options: Readonly<{
+      signal: string;
       schema?: StandardSchemaV1<unknown, Output>;
     }>,
   ): Promise<{ data: Output } | null> {
-    const signalData = await this.backend.getSignalDelivery({
+    const signalData = await this.backend.consumeSignal({
+      workflowRunId: this.workflowRunId,
       stepAttemptId: attempt.id,
+      workerId: this.workerId,
+      signal: options.signal,
     });
 
     if (signalData !== undefined) {
