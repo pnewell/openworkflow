@@ -103,6 +103,10 @@ class StaleExecutionBranchError extends Error {
  */
 class ExecutionFence {
   private active = true;
+  private readonly parking = Promise.withResolvers<never>();
+
+  /** Rejects with the sleep signal when a wait parks the execution. */
+  readonly parked = this.parking.promise;
 
   deactivate(): void {
     this.active = false;
@@ -117,12 +121,29 @@ class ExecutionFence {
       throw new StaleExecutionBranchError();
     }
   }
+
+  /**
+   * Park the execution on a wait. The returned promise never settles, so
+   * workflow code cannot catch the pause or continue past it.
+   * @param signal - Sleep signal for the wait
+   * @returns A promise that never settles
+   */
+  park(signal: SleepSignalError): Promise<never> {
+    if (this.active) {
+      this.active = false;
+      this.parking.reject(signal);
+    }
+    return new Promise<never>(() => {
+      // never settles
+    });
+  }
 }
 
 interface ExecutionFenceController {
   deactivate(): void;
   isActive(): boolean;
   assertActive(): void;
+  park(signal: SleepSignalError): Promise<never>;
 }
 
 /**
@@ -524,8 +545,10 @@ class StepExecutor implements StepApi {
 
     // Sleep attempts are not marked completed here — that happens when the
     // workflow resumes.
-    throw new SleepSignalError(
-      this.history.resolveEarliestRunningWait({ resumeAt, attempt }),
+    return await this.executionFence.park(
+      new SleepSignalError(
+        this.history.resolveEarliestRunningWait({ resumeAt, attempt }),
+      ),
     );
   }
 
@@ -686,11 +709,13 @@ class StepExecutor implements StepApi {
       timeoutAt && Number.isFinite(timeoutAt.getTime())
         ? timeoutAt
         : defaultWaitTimeoutAt(workflowAttempt.createdAt);
-    throw new SleepSignalError(
-      this.history.resolveEarliestRunningWait({
-        resumeAt,
-        attempt: workflowAttempt,
-      }),
+    return await this.executionFence.park(
+      new SleepSignalError(
+        this.history.resolveEarliestRunningWait({
+          resumeAt,
+          attempt: workflowAttempt,
+        }),
+      ),
     );
   }
 
@@ -988,8 +1013,13 @@ class StepExecutor implements StepApi {
       return await this.completeSignalWaitStep<Output>(attempt, null);
     }
 
-    throw new SleepSignalError(
-      this.history.resolveEarliestRunningWait({ resumeAt: timeoutAt, attempt }),
+    return await this.executionFence.park(
+      new SleepSignalError(
+        this.history.resolveEarliestRunningWait({
+          resumeAt: timeoutAt,
+          attempt,
+        }),
+      ),
     );
   }
 
@@ -1205,13 +1235,16 @@ async function executeWorkflowAttempt(
       startedAt: workflowRun.startedAt,
     });
 
-    // execute workflow
-    const output = await workflowFn({
-      input: workflowRun.input,
-      step: executor,
-      version: workflowVersion,
-      run,
-    });
+    // execute workflow until it returns or a wait parks the execution
+    const output = await Promise.race([
+      workflowFn({
+        input: workflowRun.input,
+        step: executor,
+        version: workflowVersion,
+        run,
+      }),
+      executionFence.parked,
+    ]);
 
     // mark success
     executionFence.deactivate();

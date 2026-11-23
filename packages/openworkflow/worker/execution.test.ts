@@ -352,6 +352,79 @@ describe("StepExecutor", () => {
     expect(sleepStepNames).toEqual(["pause", "pause:1"]);
   });
 
+  test("sleep pause cannot be caught and skips finally until resumed", async () => {
+    const backend = await createTestBackend();
+    const client = new OpenWorkflow({ backend });
+    let caught = 0;
+    let finalized = 0;
+
+    const workflow = client.defineWorkflow(
+      { name: `sleep-try-catch-${randomUUID()}` },
+      async ({ step }) => {
+        try {
+          await step.sleep("pause", "100ms");
+        } catch {
+          caught += 1;
+        } finally {
+          finalized += 1;
+        }
+        return "done";
+      },
+    );
+
+    const handle = await workflow.run();
+    const worker = client.newWorker();
+    const parked = await tickUntilParked(
+      backend,
+      worker,
+      handle.workflowRun.id,
+      200,
+      10,
+    );
+    expect(caught).toBe(0);
+    expect(finalized).toBe(0);
+
+    await sleepUntilAfter(parked.availableAt);
+    await worker.tick();
+
+    await expect(handle.result()).resolves.toBe("done");
+    expect(caught).toBe(0);
+    expect(finalized).toBe(1);
+  });
+
+  test("parks on a sleep without waiting for other branches to settle", async () => {
+    const backend = await createTestBackend();
+    const client = new OpenWorkflow({ backend });
+    const releaseBranch = Promise.withResolvers<void>();
+
+    const workflow = client.defineWorkflow(
+      { name: `sleep-pending-branch-${randomUUID()}` },
+      async ({ step }) => {
+        await Promise.allSettled([
+          step.sleep("pause", "100ms"),
+          releaseBranch.promise,
+        ]);
+        return "done";
+      },
+    );
+
+    const handle = await workflow.run();
+    const worker = client.newWorker();
+    const parked = await tickUntilParked(
+      backend,
+      worker,
+      handle.workflowRun.id,
+      200,
+      10,
+    );
+
+    releaseBranch.resolve();
+    await sleepUntilAfter(parked.availableAt);
+    await worker.tick();
+
+    await expect(handle.result()).resolves.toBe("done");
+  });
+
   test("runs a child workflow and returns child output", async () => {
     const backend = await createTestBackend();
     const client = new OpenWorkflow({ backend });
@@ -393,6 +466,40 @@ describe("StepExecutor", () => {
       (stepAttempt) => stepAttempt.kind === "workflow",
     );
     expect(workflowAttempt?.stepName).toBe(child.workflow.spec.name);
+  });
+
+  test("runWorkflow pause cannot be caught", async () => {
+    const backend = await createTestBackend();
+    const client = new OpenWorkflow({ backend });
+
+    const child = client.defineWorkflow(
+      { name: `workflow-child-try-catch-${randomUUID()}` },
+      () => 42,
+    );
+
+    const parent = client.defineWorkflow(
+      { name: `workflow-parent-try-catch-${randomUUID()}` },
+      async ({ step }) => {
+        try {
+          return await step.runWorkflow(child.workflow.spec);
+        } catch {
+          return "caught";
+        }
+      },
+    );
+
+    const worker = client.newWorker({ concurrency: 2 });
+    const handle = await parent.run();
+    const status = await tickUntilTerminal(
+      backend,
+      worker,
+      handle.workflowRun.id,
+      250,
+      10,
+    );
+
+    expect(status).toBe("completed");
+    await expect(handle.result()).resolves.toBe(42);
   });
 
   test("wakes parent runWorkflow wait when child completes before parent parks", async () => {
@@ -2694,6 +2801,42 @@ describe("StepExecutor", () => {
     expect(status).toBe("completed");
     const result = await handle.result();
     expect(result).toBeNull();
+  });
+
+  test("waitForSignal pause cannot be caught", async () => {
+    const backend = await createTestBackend();
+    const client = new OpenWorkflow({ backend });
+    const signalString = `try-catch-wait-${randomUUID()}`;
+
+    const workflow = client.defineWorkflow(
+      { name: `signal-wait-try-catch-${randomUUID()}` },
+      async ({ step }) => {
+        try {
+          return await step.waitForSignal({
+            signal: signalString,
+            timeout: 30_000,
+          });
+        } catch {
+          return "caught";
+        }
+      },
+    );
+
+    const worker = client.newWorker();
+    const handle = await workflow.run();
+    await tickUntilParked(backend, worker, handle.workflowRun.id, 20, 50);
+
+    await client.sendSignal({ signal: signalString, data: { x: 1 } });
+
+    const status = await tickUntilTerminal(
+      backend,
+      worker,
+      handle.workflowRun.id,
+      20,
+      50,
+    );
+    expect(status).toBe("completed");
+    await expect(handle.result()).resolves.toEqual({ data: { x: 1 } });
   });
 
   test("waitForSignal handles null context gracefully (corrupted row)", async () => {
