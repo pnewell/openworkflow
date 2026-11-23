@@ -3107,6 +3107,431 @@ describe("StepExecutor", () => {
     expect(childStatus).toBe("completed");
   });
 
+  // ---- step.startWorkflow --------------------------------------------------
+
+  test("startWorkflow starts a workflow run and returns its id without waiting", async () => {
+    const backend = await createTestBackend();
+    const client = new OpenWorkflow({ backend });
+
+    const started = client.defineWorkflow(
+      { name: `workflow-started-${randomUUID()}` },
+      async ({ step }) => {
+        await step.sleep("wait", "1h");
+      },
+    );
+
+    const starter = client.defineWorkflow(
+      { name: `workflow-starter-${randomUUID()}` },
+      async ({ step }) => {
+        return await step.startWorkflow(started.workflow.spec);
+      },
+    );
+
+    const worker = client.newWorker({ concurrency: 2 });
+    const handle = await starter.run();
+    const status = await tickUntilTerminal(
+      backend,
+      worker,
+      handle.workflowRun.id,
+      250,
+      10,
+    );
+    expect(status).toBe("completed");
+
+    const steps = await backend.listStepAttempts({
+      workflowRunId: handle.workflowRun.id,
+      limit: 100,
+    });
+    expect(steps.data).toHaveLength(1);
+    const startAttempt = steps.data[0];
+    expect(startAttempt).toMatchObject({
+      kind: "workflow-start",
+      stepName: started.workflow.spec.name,
+      status: "completed",
+    });
+
+    const result = await handle.result();
+    expect(result).toEqual({
+      workflowRunId: startAttempt?.childWorkflowRunId,
+    });
+    const startedRun = await backend.getWorkflowRun(result);
+    expect(startedRun).toMatchObject({
+      workflowName: started.workflow.spec.name,
+      parentStepAttemptId: startAttempt?.id,
+      deadlineAt: null,
+    });
+    expect(["pending", "running"]).toContain(startedRun?.status);
+  });
+
+  test("startWorkflow returns the same workflow run across replays", async () => {
+    const backend = await createTestBackend();
+    const client = new OpenWorkflow({ backend });
+    const startedRunIds: string[] = [];
+
+    const started = client.defineWorkflow(
+      { name: `workflow-started-replay-${randomUUID()}` },
+      () => ({ ok: true }),
+    );
+
+    const starter = client.defineWorkflow(
+      { name: `workflow-starter-replay-${randomUUID()}` },
+      async ({ step }) => {
+        const { workflowRunId } = await step.startWorkflow(
+          started.workflow.spec,
+          undefined,
+          { name: "start-report" },
+        );
+        startedRunIds.push(workflowRunId);
+        await step.sleep("wait", "10ms");
+        return workflowRunId;
+      },
+    );
+
+    const worker = client.newWorker({ concurrency: 2 });
+    const handle = await starter.run();
+    const status = await tickUntilTerminal(
+      backend,
+      worker,
+      handle.workflowRun.id,
+      250,
+      10,
+    );
+    expect(status).toBe("completed");
+
+    const startedRunId = await handle.result();
+    expect(startedRunIds).toEqual([startedRunId, startedRunId]);
+
+    const steps = await backend.listStepAttempts({
+      workflowRunId: handle.workflowRun.id,
+      limit: 100,
+    });
+    expect(
+      steps.data.find((step) => step.kind === "workflow-start")?.stepName,
+    ).toBe("start-report");
+
+    const runs = await backend.listWorkflowRuns({ limit: 100 });
+    const startedRuns = runs.data.filter(
+      (run) => run.parentStepAttemptId !== null,
+    );
+    expect(startedRuns.map((run) => run.id)).toEqual([startedRunId]);
+  });
+
+  test("startWorkflow reuses the started run after a failed link", async () => {
+    const backend = await createTestBackend();
+    const client = new OpenWorkflow({ backend });
+
+    const started = client.defineWorkflow(
+      { name: `workflow-started-link-error-${randomUUID()}` },
+      () => ({ ok: true }),
+    );
+
+    const starter = client.defineWorkflow(
+      {
+        name: `workflow-starter-link-error-${randomUUID()}`,
+        retryPolicy: {
+          initialInterval: "1ms",
+          maximumInterval: "1ms",
+          backoffCoefficient: 1,
+          maximumAttempts: 2,
+        },
+      },
+      async ({ step }) => {
+        return await step.startWorkflow(started.workflow.spec);
+      },
+    );
+
+    const handle = await starter.run();
+    const setStepAttemptChildWorkflowRunSpy = vi
+      .spyOn(backend, "setStepAttemptChildWorkflowRun")
+      .mockRejectedValueOnce(new Error("link failed"));
+
+    try {
+      const worker = client.newWorker({ concurrency: 2 });
+      const status = await tickUntilTerminal(
+        backend,
+        worker,
+        handle.workflowRun.id,
+        250,
+        10,
+      );
+      expect(status).toBe("completed");
+      expect(setStepAttemptChildWorkflowRunSpy).toHaveBeenCalledTimes(2);
+    } finally {
+      setStepAttemptChildWorkflowRunSpy.mockRestore();
+    }
+
+    const steps = await backend.listStepAttempts({
+      workflowRunId: handle.workflowRun.id,
+      limit: 100,
+    });
+    expect(steps.data).toHaveLength(1);
+    expect(steps.data[0]?.status).toBe("completed");
+
+    const runs = await backend.listWorkflowRuns({ limit: 100 });
+    const startedRuns = runs.data.filter(
+      (run) => run.parentStepAttemptId !== null,
+    );
+    expect(startedRuns).toHaveLength(1);
+    await expect(handle.result()).resolves.toEqual({
+      workflowRunId: startedRuns[0]?.id,
+    });
+  });
+
+  test("startWorkflow validates input before creating the workflow run", async () => {
+    const backend = await createTestBackend();
+    const client = new OpenWorkflow({ backend });
+
+    const started = client.defineWorkflow(
+      {
+        name: `workflow-started-schema-${randomUUID()}`,
+        schema: z.object({ email: z.email() }),
+      },
+      ({ input }: { input: { email: string } }) => {
+        return input.email;
+      },
+    );
+
+    const starter = client.defineWorkflow(
+      { name: `workflow-starter-schema-${randomUUID()}` },
+      async ({ step }) => {
+        await step.startWorkflow(started.workflow.spec, {
+          email: "not-an-email",
+        });
+        return "never";
+      },
+    );
+
+    const worker = client.newWorker();
+    const handle = await starter.run();
+    const status = await tickUntilTerminal(
+      backend,
+      worker,
+      handle.workflowRun.id,
+      150,
+      10,
+    );
+
+    expect(status).toBe("failed");
+    await expect(handle.result()).rejects.toThrow();
+
+    const steps = await backend.listStepAttempts({
+      workflowRunId: handle.workflowRun.id,
+      limit: 100,
+    });
+    expect(steps.data).toHaveLength(1);
+    expect(steps.data[0]?.status).toBe("failed");
+
+    const runs = await backend.listWorkflowRuns({ limit: 100 });
+    const startedRuns = runs.data.filter(
+      (run) => run.parentStepAttemptId !== null,
+    );
+    expect(startedRuns).toHaveLength(0);
+  });
+
+  test("fails workflow when started workflow concurrency key is empty", async () => {
+    const backend = await createTestBackend();
+    const client = new OpenWorkflow({ backend });
+
+    const starter = client.defineWorkflow(
+      { name: `workflow-starter-empty-concurrency-key-${randomUUID()}` },
+      async ({ step }) => {
+        await step.startWorkflow(
+          { name: `workflow-started-empty-concurrency-key-${randomUUID()}` },
+          undefined,
+          { concurrencyKey: "" },
+        );
+        return "never";
+      },
+    );
+
+    const worker = client.newWorker();
+    const handle = await starter.run();
+    const status = await tickUntilTerminal(
+      backend,
+      worker,
+      handle.workflowRun.id,
+      150,
+      10,
+    );
+
+    expect(status).toBe("failed");
+    await expect(handle.result()).rejects.toThrow(
+      /A concurrency key must be a nonempty string/,
+    );
+  });
+
+  test("started workflow run does not wake its starter when it finishes", async () => {
+    const backend = await createTestBackend();
+    const client = new OpenWorkflow({ backend });
+
+    const started = client.defineWorkflow(
+      { name: `workflow-started-no-wake-${randomUUID()}` },
+      () => ({ ok: true }),
+    );
+
+    const starter = client.defineWorkflow(
+      { name: `workflow-starter-no-wake-${randomUUID()}` },
+      async ({ step }) => {
+        const { workflowRunId } = await step.startWorkflow(
+          started.workflow.spec,
+        );
+        await step.sleep("wait", "1h");
+        return workflowRunId;
+      },
+    );
+
+    const worker = client.newWorker({ concurrency: 2 });
+    const handle = await starter.run();
+    const parked = await tickUntilParked(
+      backend,
+      worker,
+      handle.workflowRun.id,
+      200,
+      10,
+    );
+
+    const steps = await backend.listStepAttempts({
+      workflowRunId: handle.workflowRun.id,
+      limit: 100,
+    });
+    const startedRunId = steps.data[0]?.childWorkflowRunId;
+    if (!startedRunId) {
+      throw new Error("Expected workflow-start attempt workflow run id");
+    }
+
+    const startedStatus = await tickUntilStatus(
+      backend,
+      worker,
+      startedRunId,
+      "completed",
+      300,
+      10,
+    );
+    expect(startedStatus).toBe("completed");
+
+    expect(
+      await backend.getWorkflowRun({ workflowRunId: handle.workflowRun.id }),
+    ).toEqual(parked);
+  });
+
+  test("canceling the starter does not cancel the started workflow run", async () => {
+    const backend = await createTestBackend();
+    const client = new OpenWorkflow({ backend });
+
+    const started = client.defineWorkflow(
+      { name: `workflow-started-cancel-${randomUUID()}` },
+      async ({ step }) => {
+        await step.sleep("wait", "600ms");
+        return { startedDone: true };
+      },
+    );
+
+    const starter = client.defineWorkflow(
+      { name: `workflow-starter-cancel-${randomUUID()}` },
+      async ({ step }) => {
+        const { workflowRunId } = await step.startWorkflow(
+          started.workflow.spec,
+        );
+        await step.sleep("wait", "1h");
+        return workflowRunId;
+      },
+    );
+
+    const worker = client.newWorker({ concurrency: 2 });
+    const handle = await starter.run();
+    await tickUntilParked(backend, worker, handle.workflowRun.id, 200, 10);
+
+    const steps = await backend.listStepAttempts({
+      workflowRunId: handle.workflowRun.id,
+      limit: 100,
+    });
+    const startedRunId = steps.data[0]?.childWorkflowRunId;
+    if (!startedRunId) {
+      throw new Error("Expected workflow-start attempt workflow run id");
+    }
+
+    await handle.cancel();
+
+    const startedStatus = await tickUntilStatus(
+      backend,
+      worker,
+      startedRunId,
+      "completed",
+      300,
+      10,
+    );
+    expect(startedStatus).toBe("completed");
+  });
+
+  test("started workflow run with the starter's concurrency key starts after the starter ends", async () => {
+    const backend = await createTestBackend();
+    const client = new OpenWorkflow({ backend });
+    const concurrencyKey = randomUUID();
+
+    const started = client.defineWorkflow(
+      { name: `workflow-started-own-concurrency-key-${randomUUID()}` },
+      () => ({ ok: true }),
+    );
+
+    const starter = client.defineWorkflow(
+      { name: `workflow-starter-own-concurrency-key-${randomUUID()}` },
+      async ({ step }) => {
+        const { workflowRunId } = await step.startWorkflow(
+          started.workflow.spec,
+          undefined,
+          { concurrencyKey },
+        );
+        await step.sleep("wait", "100ms");
+        return workflowRunId;
+      },
+    );
+
+    const worker = client.newWorker({ concurrency: 2 });
+    const handle = await starter.run(undefined, { concurrencyKey });
+    await tickUntilParked(backend, worker, handle.workflowRun.id, 200, 10);
+
+    const steps = await backend.listStepAttempts({
+      workflowRunId: handle.workflowRun.id,
+      limit: 100,
+    });
+    const startedRunId = steps.data[0]?.childWorkflowRunId;
+    if (!startedRunId) {
+      throw new Error("Expected workflow-start attempt workflow run id");
+    }
+    expect(
+      await backend.getWorkflowRun({ workflowRunId: startedRunId }),
+    ).toMatchObject({ status: "pending", attempts: 0, concurrencyKey });
+
+    const starterStatus = await tickUntilTerminal(
+      backend,
+      worker,
+      handle.workflowRun.id,
+      250,
+      10,
+    );
+    expect(starterStatus).toBe("completed");
+
+    const startedStatus = await tickUntilStatus(
+      backend,
+      worker,
+      startedRunId,
+      "completed",
+      250,
+      10,
+    );
+    expect(startedStatus).toBe("completed");
+
+    const starterRun = await backend.getWorkflowRun({
+      workflowRunId: handle.workflowRun.id,
+    });
+    const startedRun = await backend.getWorkflowRun({
+      workflowRunId: startedRunId,
+    });
+    expect(startedRun?.startedAt?.getTime()).toBeGreaterThanOrEqual(
+      starterRun?.finishedAt?.getTime() ?? Infinity,
+    );
+  });
+
   // ---- step.sendSignal / step.waitForSignal --------------------------------
 
   test("sendSignal sends a signal and returns workflow run IDs", async () => {

@@ -28,6 +28,7 @@ import {
 } from "../core/workflow-definition.js";
 import type {
   StepRunWorkflowOptions,
+  StepStartWorkflowOptions,
   StepApi,
   StepFunction,
   StepFunctionConfig,
@@ -791,6 +792,70 @@ class StepExecutor implements StepApi {
     this.history.replaceRunningAttempt(linked);
 
     return linked;
+  }
+
+  // ---- step.startWorkflow ------------------------------------------------
+
+  async startWorkflow<Input, Output, RunInput = Input>(
+    spec: WorkflowSpec<Input, Output, RunInput>,
+    input?: RunInput,
+    options?: Readonly<StepStartWorkflowOptions>,
+  ): Promise<{ workflowRunId: string }> {
+    const stepName = this.history.resolveStepName(options?.name ?? spec.name);
+    const request: RunWorkflowStepRequest<Input, Output, RunInput> = {
+      workflowSpec: spec,
+      input,
+      timeout: undefined,
+      concurrencyKey: options?.concurrencyKey,
+    };
+
+    const existingAttempt = this.history.findCached(stepName);
+    if (existingAttempt) {
+      // safety: this workflow-start step persists the id of the workflow run it started.
+      return existingAttempt.output as { workflowRunId: string };
+    }
+
+    this.throwFinalFailure(stepName, TERMINAL_STEP_RETRY_POLICY);
+
+    // Resume a running workflow-start attempt (replay path)
+    const runningAttempt = this.history.findRunning(stepName);
+    if (runningAttempt?.kind === "workflow-start") {
+      return await this.resolveWorkflowStart(runningAttempt, request);
+    }
+
+    // First encounter — create the workflow-start step and the workflow run
+    validateConcurrencyKey(request.concurrencyKey);
+    const attempt = await this.createNewStepAttempt(
+      stepName,
+      "workflow-start",
+      null,
+    );
+
+    return await this.resolveWorkflowStart(attempt, request);
+  }
+
+  /**
+   * Resolve a running workflow-start attempt — ensure the started workflow run
+   * is linked, then complete the step.
+   * @param runningAttempt - Workflow-start step attempt
+   * @param request - Workflow step request
+   * @returns The started workflow run's id
+   */
+  private async resolveWorkflowStart<Input, Output, RunInput = Input>(
+    runningAttempt: Readonly<StepAttempt>,
+    request: Readonly<RunWorkflowStepRequest<Input, Output, RunInput>>,
+  ): Promise<{ workflowRunId: string }> {
+    const linkedAttempt =
+      runningAttempt.childWorkflowRunId &&
+      runningAttempt.childWorkflowRunNamespaceId
+        ? runningAttempt
+        : await this.linkChildWorkflowRun(runningAttempt, request);
+
+    const completed = await this.completeStepAttemptAndRecord(linkedAttempt, {
+      workflowRunId: linkedAttempt.childWorkflowRunId,
+    });
+    // safety: this workflow-start step persists the id of the workflow run it started.
+    return completed.output as { workflowRunId: string };
   }
 
   /**

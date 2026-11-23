@@ -8,7 +8,12 @@ import { err, ok } from "./result.js";
  * The kind of step in a workflow.
  */
 export type StepKind =
-  "function" | "sleep" | "workflow" | "signal-send" | "signal-wait";
+  | "function"
+  | "sleep"
+  | "workflow"
+  | "workflow-start"
+  | "signal-send"
+  | "signal-wait";
 
 /**
  * Status of a step attempt through its lifecycle.

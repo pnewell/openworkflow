@@ -115,7 +115,7 @@ await step.run({ name: "log-event" }, async () => {
 
 ## Step Types
 
-OpenWorkflow provides five step types:
+OpenWorkflow provides six step types:
 
 ### `step.run()`
 
@@ -146,6 +146,17 @@ const childOutput = await step.runWorkflow(
   { reportId: input.reportId },
   { timeout: "5m" }, // optional, defaults to 1 year
 );
+```
+
+### `step.startWorkflow()`
+
+Starts another workflow run and returns its ID without waiting for it. See
+[Child Workflows](/docs/child-workflows#starting-without-waiting) for details:
+
+```ts
+const { workflowRunId } = await step.startWorkflow(sendReceiptWorkflow.spec, {
+  orderId: input.orderId,
+});
 ```
 
 ### `step.sendSignal()`

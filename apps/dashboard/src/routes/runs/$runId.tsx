@@ -91,7 +91,9 @@ export const Route = createFileRoute("/runs/$runId")({
       ...new Set(
         steps
           .map((step) =>
-            step.kind === "workflow" ? step.childWorkflowRunId : null,
+            step.kind === "workflow" || step.kind === "workflow-start"
+              ? step.childWorkflowRunId
+              : null,
           )
           .filter((childRunId): childRunId is string => childRunId !== null),
       ),
@@ -234,7 +236,9 @@ function RunDetailsPage() {
       ? -1
       : steps.findIndex((step) => step.id === selectedStepId);
   const selectedStepChildRun =
-    selectedStep?.kind === "workflow" && selectedStep.childWorkflowRunId
+    (selectedStep?.kind === "workflow" ||
+      selectedStep?.kind === "workflow-start") &&
+    selectedStep.childWorkflowRunId
       ? (childRunsById[selectedStep.childWorkflowRunId] ?? null)
       : null;
 
@@ -357,7 +361,9 @@ function RunDetailsPage() {
                     referenceNowMs,
                   );
                   const childRunId =
-                    step.kind === "workflow" ? step.childWorkflowRunId : null;
+                    step.kind === "workflow" || step.kind === "workflow-start"
+                      ? step.childWorkflowRunId
+                      : null;
                   const childRun = childRunId
                     ? (childRunsById[childRunId] ?? null)
                     : null;

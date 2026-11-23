@@ -245,6 +245,12 @@ target workflow name in `spec`) and `options.timeout` controls the wait timeout
 (default 1y). When the timeout is reached, the parent step fails but the child
 workflow continues running independently.
 
+**`step.startWorkflow(spec, input?, options?)`**: Starts a workflow run and
+returns its ID without waiting for it. The start is recorded as a step attempt
+so it won't repeat on replay. The started run is independent: it is not ended
+when the workflow that started it ends, and its completion does not wake that
+workflow.
+
 **`step.sendSignal(options)`**: Sends a named signal to all workflows currently
 waiting on it. The send is recorded as a step attempt so it won't repeat on
 replay. If no workflow is waiting, the signal is silently dropped.
@@ -268,11 +274,11 @@ const result = await step.waitForSignal({
 });
 ```
 
-All step APIs (`step.run`, `step.sleep`, `step.runWorkflow`, `step.sendSignal`,
-and `step.waitForSignal`) share the same collision logic for durable keys. If
-duplicate base names are encountered in one execution pass, OpenWorkflow
-auto-indexes them as `name`, `name:1`, `name:2`, and so on so each step call
-maps to a distinct step attempt.
+All step APIs (`step.run`, `step.sleep`, `step.runWorkflow`,
+`step.startWorkflow`, `step.sendSignal`, and `step.waitForSignal`) share the
+same collision logic for durable keys. If duplicate base names are encountered
+in one execution pass, OpenWorkflow auto-indexes them as `name`, `name:1`,
+`name:2`, and so on so each step call maps to a distinct step attempt.
 
 ## 4. Error Handling & Retries
 

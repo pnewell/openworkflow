@@ -175,3 +175,24 @@ const [payment, shipping] = await Promise.all([
   }),
 ]);
 ```
+
+## Starting Without Waiting
+
+Use `step.startWorkflow()` to start another workflow run and carry on without
+waiting for it. It returns the started run's ID:
+
+```ts
+const { workflowRunId } = await step.startWorkflow(sendReceipt.spec, {
+  orderId: input.orderId,
+});
+```
+
+The start is recorded as a step, so a replay returns the same run instead of
+starting another. The started run is independent: it keeps running when the
+workflow that started it finishes or is canceled, and its result is not
+returned to that workflow.
+
+`options.name` sets the durable step name, which defaults to the target
+workflow name. `options.concurrencyKey` gives the started run a
+[concurrency key](/docs/workflows#concurrency-key-optional). A run started with
+the key its starter holds waits in line and starts after the starter ends.
