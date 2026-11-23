@@ -108,6 +108,7 @@ export interface CreateWorkflowRunParams {
   workflowName: string;
   version: string | null;
   idempotencyKey: string | null;
+  idempotencyPeriodMs?: number; // omitted = 24 hours, 0 = no limit
   config: JsonValue;
   context: JsonValue | null;
   input: JsonValue | null;
@@ -250,6 +251,20 @@ export interface PaginatedResponse<T> {
     next: string | null;
     prev: string | null;
   };
+}
+
+/**
+ * Resolve the earliest creation time an existing run can have to be reused
+ * for an idempotency key.
+ * @param idempotencyPeriodMs - Idempotency period in milliseconds (0 = no limit)
+ * @param now - Current time in milliseconds
+ * @returns Earliest creation time that still matches the key
+ */
+export function resolveIdempotencyCutoff(
+  idempotencyPeriodMs: number = DEFAULT_RUN_IDEMPOTENCY_PERIOD_MS,
+  now: number = Date.now(),
+): Date {
+  return new Date(idempotencyPeriodMs === 0 ? 0 : now - idempotencyPeriodMs);
 }
 
 export type WorkflowRunCounts = Omit<

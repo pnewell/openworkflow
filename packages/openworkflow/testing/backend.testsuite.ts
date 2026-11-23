@@ -392,6 +392,81 @@ export function testBackend(options: TestBackendOptions): void {
         }
       });
 
+      test("honors the idempotency period given on the call", async () => {
+        const backend = await setup();
+        const params = {
+          workflowName: randomUUID(),
+          version: null,
+          idempotencyKey: randomUUID(),
+          input: null,
+          config: {},
+          context: null,
+          parentStepAttemptNamespaceId: null,
+          parentStepAttemptId: null,
+          availableAt: null,
+          deadlineAt: null,
+        };
+        const now = Date.now();
+        const nowSpy = vi.spyOn(Date, "now");
+
+        try {
+          nowSpy.mockReturnValue(now);
+          const first = await backend.createWorkflowRun(params);
+
+          nowSpy.mockReturnValue(now + 120_000);
+          const withinPeriod = await backend.createWorkflowRun({
+            ...params,
+            idempotencyPeriodMs: 180_000,
+          });
+          expect(withinPeriod.id).toBe(first.id);
+
+          const afterPeriod = await backend.createWorkflowRun({
+            ...params,
+            idempotencyPeriodMs: 60_000,
+          });
+          expect(afterPeriod.id).not.toBe(first.id);
+        } finally {
+          nowSpy.mockRestore();
+          await teardown(backend);
+        }
+      });
+
+      test("never expires the key when the idempotency period is 0", async () => {
+        const backend = await setup();
+        const params = {
+          workflowName: randomUUID(),
+          version: null,
+          idempotencyKey: randomUUID(),
+          input: null,
+          config: {},
+          context: null,
+          parentStepAttemptNamespaceId: null,
+          parentStepAttemptId: null,
+          availableAt: null,
+          deadlineAt: null,
+        };
+        const now = Date.now();
+        const nowSpy = vi.spyOn(Date, "now");
+
+        try {
+          nowSpy.mockReturnValue(now);
+          const first = await backend.createWorkflowRun(params);
+
+          nowSpy.mockReturnValue(
+            now + DEFAULT_RUN_IDEMPOTENCY_PERIOD_MS + 60_000,
+          );
+          const second = await backend.createWorkflowRun({
+            ...params,
+            idempotencyPeriodMs: 0,
+          });
+
+          expect(second.id).toBe(first.id);
+        } finally {
+          nowSpy.mockRestore();
+          await teardown(backend);
+        }
+      });
+
       test("creates distinct runs when idempotency key is null", async () => {
         const backend = await setup();
         const workflowName = randomUUID();

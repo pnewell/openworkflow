@@ -1,4 +1,8 @@
-import { toWorkflowRunCounts } from "./backend.js";
+import {
+  DEFAULT_RUN_IDEMPOTENCY_PERIOD_MS,
+  resolveIdempotencyCutoff,
+  toWorkflowRunCounts,
+} from "./backend.js";
 import { describe, expect, test } from "vitest";
 
 describe("toWorkflowRunCounts", () => {
@@ -47,5 +51,25 @@ describe("toWorkflowRunCounts", () => {
       failed: 0,
       canceled: 0,
     });
+  });
+});
+
+describe("resolveIdempotencyCutoff", () => {
+  const now = Date.parse("2026-01-02T00:00:00.000Z");
+
+  test("defaults to the 24 hour idempotency period", () => {
+    expect(resolveIdempotencyCutoff(undefined, now)).toEqual(
+      new Date(now - DEFAULT_RUN_IDEMPOTENCY_PERIOD_MS),
+    );
+  });
+
+  test("subtracts the given period from now", () => {
+    expect(resolveIdempotencyCutoff(60_000, now)).toEqual(
+      new Date(now - 60_000),
+    );
+  });
+
+  test("treats 0 as no limit", () => {
+    expect(resolveIdempotencyCutoff(0, now)).toEqual(new Date(0));
   });
 });

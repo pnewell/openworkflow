@@ -633,6 +633,80 @@ describe("OpenWorkflow", () => {
     expect(second.workflowRun.id).not.toBe(first.workflowRun.id);
   });
 
+  test("honors a custom idempotencyPeriod", async () => {
+    const backend = await createTestBackend();
+    const client = new OpenWorkflow({ backend });
+    const workflow = client.defineWorkflow(
+      { name: "idempotency-period-test" },
+      noopFn,
+    );
+    const key = randomUUID();
+
+    const first = await workflow.run({ value: 1 }, { idempotencyKey: key });
+
+    const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    const pg = newPostgresMaxOne(DEFAULT_POSTGRES_URL);
+    try {
+      const workflowRunsTable = pg`${pg(DEFAULT_SCHEMA)}.${pg("workflow_runs")}`;
+      await pg`
+        UPDATE ${workflowRunsTable}
+        SET "created_at" = ${twoHoursAgo}
+        WHERE "namespace_id" = ${first.workflowRun.namespaceId}
+          AND "id" = ${first.workflowRun.id}
+      `;
+    } finally {
+      await pg.end();
+    }
+
+    const withinPeriod = await workflow.run(
+      { value: 2 },
+      { idempotencyKey: key, idempotencyPeriod: "3h" },
+    );
+    expect(withinPeriod.workflowRun.id).toBe(first.workflowRun.id);
+
+    const noLimit = await workflow.run(
+      { value: 2 },
+      { idempotencyKey: key, idempotencyPeriod: 0 },
+    );
+    expect(noLimit.workflowRun.id).toBe(first.workflowRun.id);
+
+    const afterPeriod = await workflow.run(
+      { value: 2 },
+      { idempotencyKey: key, idempotencyPeriod: 60 * 60 * 1000 },
+    );
+    expect(afterPeriod.workflowRun.id).not.toBe(first.workflowRun.id);
+  });
+
+  test("throws for invalid idempotencyPeriod", async () => {
+    const backend = await createTestBackend();
+    const client = new OpenWorkflow({ backend });
+    const workflow = client.defineWorkflow(
+      { name: "idempotency-period-invalid-test" },
+      noopFn,
+    );
+    const key = randomUUID();
+
+    await expect(
+      workflow.run(
+        { value: 1 },
+        { idempotencyKey: key, idempotencyPeriod: -1 },
+      ),
+    ).rejects.toThrow("Idempotency period must be a non-negative number");
+    await expect(
+      workflow.run(
+        { value: 1 },
+        { idempotencyKey: key, idempotencyPeriod: Number.POSITIVE_INFINITY },
+      ),
+    ).rejects.toThrow("Idempotency period must be a non-negative number");
+    await expect(
+      workflow.run(
+        { value: 1 },
+        // @ts-expect-error - invalid duration format
+        { idempotencyKey: key, idempotencyPeriod: "not-a-duration" },
+      ),
+    ).rejects.toThrow('Invalid duration format: "not-a-duration"');
+  });
+
   test("cancels workflow run via handle", async () => {
     const backend = await createTestBackend();
     const client = new OpenWorkflow({ backend });

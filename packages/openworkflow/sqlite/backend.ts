@@ -1,7 +1,6 @@
 import {
   WorkflowRunCounts,
   DEFAULT_NAMESPACE_ID,
-  DEFAULT_RUN_IDEMPOTENCY_PERIOD_MS,
   Backend,
   CancelWorkflowRunParams,
   ClaimWorkflowRunParams,
@@ -25,6 +24,7 @@ import {
   SendSignalResult,
   GetSignalDeliveryParams,
   toWorkflowRunCounts,
+  resolveIdempotencyCutoff,
   type EnqueueScheduledRunsParams,
   type PaginationOptions,
   type WorkflowScheduleIdParams,
@@ -333,7 +333,7 @@ export class BackendSqlite implements Backend {
       const existing = this.getWorkflowRunByIdempotencyKey(
         workflowName,
         idempotencyKey,
-        new Date(Date.now() - DEFAULT_RUN_IDEMPOTENCY_PERIOD_MS),
+        resolveIdempotencyCutoff(params.idempotencyPeriodMs),
       );
       if (existing) {
         this.db.exec("COMMIT");

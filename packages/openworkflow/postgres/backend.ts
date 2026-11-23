@@ -1,7 +1,7 @@
 import {
   toWorkflowRunCounts,
+  resolveIdempotencyCutoff,
   DEFAULT_NAMESPACE_ID,
-  DEFAULT_RUN_IDEMPOTENCY_PERIOD_MS,
   Backend,
   WorkflowRunCounts,
   CancelWorkflowRunParams,
@@ -376,7 +376,7 @@ export class BackendPostgres implements Backend {
         tx,
         workflowName,
         idempotencyKey,
-        new Date(Date.now() - DEFAULT_RUN_IDEMPOTENCY_PERIOD_MS),
+        resolveIdempotencyCutoff(params.idempotencyPeriodMs),
       );
       if (existing) {
         return existing;

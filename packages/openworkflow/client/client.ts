@@ -1,10 +1,11 @@
-import type {
-  Backend,
-  PaginatedResponse,
-  PaginationOptions,
-  SendSignalResult,
+import {
+  DEFAULT_RUN_IDEMPOTENCY_PERIOD_MS,
+  type Backend,
+  type PaginatedResponse,
+  type PaginationOptions,
+  type SendSignalResult,
 } from "../core/backend.js";
-import type { DurationString } from "../core/duration.js";
+import { parseDuration, type DurationString } from "../core/duration.js";
 import type { JsonValue } from "../core/json.js";
 import type { Logger } from "../core/logger.js";
 import {
@@ -165,11 +166,15 @@ export class OpenWorkflow {
         }
         const parsedInput = validationResult.value;
         const availableAt = resolveAvailableAt(options?.availableAt);
+        const idempotencyPeriodMs = resolveIdempotencyPeriodMs(
+          options?.idempotencyPeriod,
+        );
 
         const workflowRun = await this.backend.createWorkflowRun({
           workflowName: spec.name,
           version: spec.version ?? null,
           idempotencyKey: options?.idempotencyKey ?? null,
+          idempotencyPeriodMs,
           config: {},
           context: captureTraceContext(),
           input: parsedInput ?? null,
@@ -409,9 +414,16 @@ export interface WorkflowRunOptions {
   deadlineAt?: Date;
   /**
    * Prevent duplicate workflow run creation for the same workflow and key.
-   * Reusing the same key returns the existing run for up to 24 hours.
+   * Reusing the same key returns the existing run for the idempotency period.
    */
   idempotencyKey?: string;
+  /**
+   * How long a reused `idempotencyKey` returns the existing run, measured from
+   * that run's creation. Accepts milliseconds or a duration string (e.g.
+   * "7d"). Use `0` to never expire.
+   * @default 86400000 (24 hours)
+   */
+  idempotencyPeriod?: number | DurationString;
 }
 
 /**
@@ -427,6 +439,35 @@ function resolveAvailableAt(
   if (availableAt instanceof Date) return availableAt;
 
   const result = calculateDateFromDuration(availableAt);
+  if (!result.ok) {
+    throw result.error;
+  }
+
+  return result.value;
+}
+
+/**
+ * Resolve idempotencyPeriod to milliseconds.
+ * @param idempotencyPeriod - Milliseconds or duration string
+ * @returns Idempotency period in milliseconds
+ * @throws {Error} When the period is invalid
+ */
+function resolveIdempotencyPeriodMs(
+  idempotencyPeriod: number | DurationString | undefined,
+): number {
+  if (idempotencyPeriod === undefined) {
+    return DEFAULT_RUN_IDEMPOTENCY_PERIOD_MS;
+  }
+
+  // oxlint-disable-next-line anti-slop/no-runtime-typeof -- numeric periods are milliseconds, strings are duration expressions
+  if (typeof idempotencyPeriod === "number") {
+    if (!Number.isFinite(idempotencyPeriod) || idempotencyPeriod < 0) {
+      throw new Error("Idempotency period must be a non-negative number");
+    }
+    return idempotencyPeriod;
+  }
+
+  const result = parseDuration(idempotencyPeriod);
   if (!result.ok) {
     throw result.error;
   }

@@ -205,9 +205,20 @@ const handle = await ow.runWorkflow(
 
 Within a given namespace, when an existing run matches the same
 `workflowName` + `idempotencyKey`, OpenWorkflow returns that existing run
-immediately. This dedupe window is built-in and lasts 24 hours from the original
-run creation time. The same `idempotencyKey` used in a different namespace will
+immediately. This dedupe window lasts 24 hours from the original run creation
+time by default. The same `idempotencyKey` used in a different namespace will
 create a separate run.
+
+Set `idempotencyPeriod` to change the window for a call. It accepts
+milliseconds or a duration string, and `0` means the key never expires:
+
+```ts
+const handle = await ow.runWorkflow(
+  sendWelcomeEmail.spec,
+  { userId: "user_123" },
+  { idempotencyKey: "welcome-email:user_123", idempotencyPeriod: "7d" },
+);
+```
 
 ## Workflow Function Parameters
 
