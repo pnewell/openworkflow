@@ -5,7 +5,11 @@ import { DEFAULT_WORKFLOW_RETRY_POLICY } from "../core/workflow-definition.js";
 import type { WorkflowFunctionParams } from "../core/workflow-function.js";
 import type { WorkflowRun } from "../core/workflow-run.js";
 import type { BackendPostgres } from "../postgres.js";
-import { createTestBackend } from "../postgres/test-backend.testsuite.js";
+import { DEFAULT_SCHEMA, newPostgresMaxOne } from "../postgres/postgres.js";
+import {
+  createTestBackend,
+  TEST_POSTGRES_URL,
+} from "../postgres/test-backend.testsuite.js";
 import { createStubBackend } from "../testing/backend-stub.testsuite.js";
 import {
   WORKFLOW_STEP_LIMIT,
@@ -900,6 +904,151 @@ describe("StepExecutor", () => {
       (run) => run.parentStepAttemptId !== null,
     );
     expect(childRuns).toHaveLength(0);
+  });
+
+  test("leaves the workflow step open when child run creation fails", async () => {
+    const backend = await createTestBackend();
+    const client = new OpenWorkflow({ backend });
+    const createError = new Error("create failed");
+    const caught: unknown[] = [];
+
+    const child = client.defineWorkflow(
+      { name: `workflow-child-create-error-${randomUUID()}` },
+      () => 42,
+    );
+
+    const parent = client.defineWorkflow(
+      {
+        name: `workflow-parent-create-error-${randomUUID()}`,
+        retryPolicy: {
+          initialInterval: "1ms",
+          maximumInterval: "1ms",
+          backoffCoefficient: 1,
+          maximumAttempts: 2,
+        },
+      },
+      async ({ step }) => {
+        try {
+          return await step.runWorkflow(child.workflow.spec);
+        } catch (error) {
+          caught.push(error);
+          throw error;
+        }
+      },
+    );
+
+    const handle = await parent.run();
+    const createWorkflowRunSpy = vi
+      .spyOn(backend, "createWorkflowRun")
+      .mockRejectedValueOnce(createError);
+
+    try {
+      const worker = client.newWorker({ concurrency: 2 });
+      const status = await tickUntilTerminal(
+        backend,
+        worker,
+        handle.workflowRun.id,
+        250,
+        10,
+      );
+      expect(status).toBe("completed");
+    } finally {
+      createWorkflowRunSpy.mockRestore();
+    }
+
+    await expect(handle.result()).resolves.toBe(42);
+    expect(caught).toHaveLength(1);
+    expect(caught[0]).toBe(createError);
+
+    const steps = await backend.listStepAttempts({
+      workflowRunId: handle.workflowRun.id,
+      limit: 100,
+    });
+    expect(steps.data).toHaveLength(1);
+    expect(steps.data[0]?.status).toBe("completed");
+  });
+
+  test("reuses the child run after a failed link, even past the idempotency period", async () => {
+    const backend = await createTestBackend();
+    const client = new OpenWorkflow({ backend });
+
+    const child = client.defineWorkflow(
+      { name: `workflow-child-link-error-${randomUUID()}` },
+      () => 42,
+    );
+
+    const parent = client.defineWorkflow(
+      { name: `workflow-parent-link-error-${randomUUID()}` },
+      async ({ step }) => {
+        return await step.runWorkflow(child.workflow.spec);
+      },
+    );
+
+    const handle = await parent.run();
+    const claimedParent = await backend.claimWorkflowRun({
+      workerId: randomUUID(),
+      leaseDurationMs: 5000,
+    });
+    if (!claimedParent) {
+      throw new Error("Expected parent workflow run to be claimed");
+    }
+
+    const setStepAttemptChildWorkflowRunSpy = vi
+      .spyOn(backend, "setStepAttemptChildWorkflowRun")
+      .mockRejectedValueOnce(new Error("link failed"));
+
+    try {
+      await executeWorkflow({
+        backend,
+        workflowRun: claimedParent,
+        workflowFn: parent.workflow.fn,
+        workflowVersion: parent.workflow.spec.version ?? null,
+        workerId: claimedParent.workerId ?? "",
+        retryPolicy: {
+          ...DEFAULT_WORKFLOW_RETRY_POLICY,
+          initialInterval: "1ms",
+          maximumAttempts: 2,
+        },
+      });
+    } finally {
+      setStepAttemptChildWorkflowRunSpy.mockRestore();
+    }
+
+    const parentAfter = await backend.getWorkflowRun({
+      workflowRunId: handle.workflowRun.id,
+    });
+    expect(parentAfter?.status).toBe("pending");
+    expect(parentAfter?.error?.message).toBe("link failed");
+
+    const pg = newPostgresMaxOne(TEST_POSTGRES_URL);
+    try {
+      const workflowRunsTable = pg`${pg(DEFAULT_SCHEMA)}.${pg("workflow_runs")}`;
+      await pg`
+        UPDATE ${workflowRunsTable}
+        SET "created_at" = ${new Date(Date.now() - 48 * 60 * 60 * 1000)}
+        WHERE "namespace_id" = ${claimedParent.namespaceId}
+          AND "parent_step_attempt_id" IS NOT NULL
+      `;
+    } finally {
+      await pg.end();
+    }
+
+    const worker = client.newWorker({ concurrency: 2 });
+    const status = await tickUntilTerminal(
+      backend,
+      worker,
+      handle.workflowRun.id,
+      250,
+      10,
+    );
+    expect(status).toBe("completed");
+    await expect(handle.result()).resolves.toBe(42);
+
+    const runs = await backend.listWorkflowRuns({ limit: 100 });
+    const childRuns = runs.data.filter(
+      (run) => run.parentStepAttemptId !== null,
+    );
+    expect(childRuns).toHaveLength(1);
   });
 
   test("handles runWorkflow replay with non-workflow context shape", async () => {

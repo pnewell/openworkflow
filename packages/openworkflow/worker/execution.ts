@@ -608,13 +608,7 @@ class StepExecutor implements StepApi {
       createWorkflowContext(timeoutAt),
     );
 
-    const linkedAttempt = await this.linkChildWorkflowRun(
-      attempt,
-      request,
-    ).catch(
-      async (cause: unknown) =>
-        await this.failWorkflowStepUnlessStale(stepName, attempt.id, cause),
-    );
+    const linkedAttempt = await this.linkChildWorkflowRun(attempt, request);
 
     return await this.resolveRunningWorkflow(stepName, linkedAttempt, request);
   }
@@ -736,7 +730,12 @@ class StepExecutor implements StepApi {
       request.input,
     );
     if (!validationResult.success) {
-      throw new Error(validationResult.error);
+      return await this.failStepWithError(
+        attempt.stepName,
+        attempt.id,
+        new Error(validationResult.error),
+        TERMINAL_STEP_RETRY_POLICY,
+      );
     }
     const parsedInput = validationResult.value;
 
@@ -754,6 +753,7 @@ class StepExecutor implements StepApi {
           workflowName: request.workflowSpec.name,
           version: request.workflowSpec.version ?? null,
           idempotencyKey: buildWorkflowIdempotencyKey(attempt),
+          idempotencyPeriodMs: 0,
           config: {},
           context: captureTraceContext(),
           input: normalizeStepOutput(parsedInput),
@@ -818,25 +818,6 @@ class StepExecutor implements StepApi {
       retryPolicy,
       error: cause,
     });
-  }
-
-  private async failWorkflowStepUnlessStale(
-    stepName: string,
-    stepAttemptId: string,
-    cause: unknown,
-  ): Promise<never> {
-    if (cause instanceof StaleExecutionBranchError) {
-      throw cause;
-    }
-
-    this.assertExecutionActive();
-
-    return await this.failStepWithError(
-      stepName,
-      stepAttemptId,
-      cause,
-      TERMINAL_STEP_RETRY_POLICY,
-    );
   }
 
   // ---- step.sendSignal ----------------------------------------------------
