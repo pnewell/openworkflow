@@ -2,7 +2,8 @@ import { OpenWorkflow } from "../client/client.js";
 import type { Backend } from "../core/backend.js";
 import { defineWorkflowSpec } from "../core/workflow-definition.js";
 import type { TestBackendOptions } from "./backend.testsuite.js";
-import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { randomUUID } from "node:crypto";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 /**
  * Exercise identical schedule contracts on every backend.
@@ -121,6 +122,89 @@ export function testWorkflowSchedules(options: TestBackendOptions): void {
       });
       expect(timezone.nextRunAt?.getUTCHours()).toBe(3);
       expect(timezone.nextRunAt?.getUTCMinutes()).toBe(30);
+    });
+
+    test("registration replaces overlap, omission resets it, and pausing preserves it", async () => {
+      const skipping = await ow.scheduleWorkflow(spec, input, {
+        ...config,
+        overlap: "skip",
+      });
+      expect(skipping.overlap).toBe("skip");
+      const paused = await ow.schedules.pause(skipping.id);
+      expect(paused.overlap).toBe("skip");
+      const resumed = await ow.schedules.resume(skipping.id);
+      expect(resumed.overlap).toBe("skip");
+      const replaced = await ow.scheduleWorkflow(spec, input, config);
+      expect(replaced.overlap).toBe("allow");
+      expect(replaced.nextRunAt).toEqual(resumed.nextRunAt);
+    });
+
+    test("skip starts no run while an earlier one is unfinished and still advances the schedule", async () => {
+      const schedule = await ow.scheduleWorkflow(spec, input, {
+        cron: "* * * * * *",
+        overlap: "skip",
+      });
+      const day = 86_400_000;
+      const dispatch = async (before: Date) => {
+        expect(await backend.enqueueScheduledRuns({ before, limit: 100 })).toBe(
+          1,
+        );
+        const advanced = await ow.schedules.get(schedule.id);
+        expect(advanced?.nextRunAt?.getTime()).toBeGreaterThan(
+          before.getTime(),
+        );
+        const runPage = await backend.listWorkflowRuns({});
+        return runPage.data.length;
+      };
+      expect(await dispatch(schedule.nextRunAt ?? new Date())).toBe(1);
+      expect(await dispatch(new Date(Date.now() + day))).toBe(1);
+      const workerId = randomUUID();
+      const run = await vi.waitFor(
+        async () => {
+          const claimed = await backend.claimWorkflowRun({
+            workerId,
+            leaseDurationMs: 60_000,
+          });
+          if (!claimed) throw new Error("Scheduled run is not available yet");
+          return claimed;
+        },
+        { timeout: 5000 },
+      );
+      expect(await dispatch(new Date(Date.now() + 2 * day))).toBe(1);
+      await backend.sleepWorkflowRun({
+        workflowRunId: run.id,
+        workerId,
+        availableAt: new Date(Date.now() + day),
+      });
+      expect(await dispatch(new Date(Date.now() + 3 * day))).toBe(1);
+      await backend.cancelWorkflowRun({ workflowRunId: run.id });
+      expect(await dispatch(new Date(Date.now() + 4 * day))).toBe(2);
+    });
+
+    test("skip ignores reruns and runs that did not come from the schedule", async () => {
+      const schedule = await ow.scheduleWorkflow(spec, input, {
+        ...config,
+        overlap: "skip",
+      });
+      const day = 86_400_000;
+      await backend.enqueueScheduledRuns({
+        before: new Date(Date.now() + day),
+        limit: 100,
+      });
+      const scheduled = await backend.listWorkflowRuns({});
+      const scheduledRunId = scheduled.data[0]?.id ?? "";
+      await ow.cancelWorkflowRun(scheduledRunId);
+      const rerun = await ow.rerunWorkflowRun(scheduledRunId);
+      expect(rerun.workflowScheduleId).toBeNull();
+      await ow.runWorkflow(spec, input);
+      await backend.enqueueScheduledRuns({
+        before: new Date(Date.now() + 2 * day),
+        limit: 100,
+      });
+      const runPage = await backend.listWorkflowRuns({});
+      expect(
+        runPage.data.filter((run) => run.workflowScheduleId === schedule.id),
+      ).toHaveLength(2);
     });
 
     test("dispatch is bounded and collapses years of missed occurrences into one run per schedule", async () => {

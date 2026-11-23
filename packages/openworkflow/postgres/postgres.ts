@@ -361,6 +361,28 @@ export function migrations(schema: string): string[] {
     ON CONFLICT DO NOTHING;
 
     COMMIT;`,
+
+    // 10 - schedule overlap
+    `BEGIN;
+
+    ALTER TABLE ${quotedSchema}."workflow_schedules"
+    ADD COLUMN IF NOT EXISTS "overlap" TEXT NOT NULL DEFAULT 'allow';
+
+    COMMIT;
+
+    -- statement-breakpoint
+    CREATE INDEX CONCURRENTLY IF NOT EXISTS "workflow_runs_workflow_schedule_id_idx"
+    ON ${quotedSchema}."workflow_runs" ("namespace_id", "workflow_schedule_id")
+    WHERE "workflow_schedule_id" IS NOT NULL AND "status" IN ('pending', 'running', 'sleeping');
+
+    -- statement-breakpoint
+    BEGIN;
+
+    INSERT INTO ${quotedSchema}."openworkflow_migrations"("version")
+    VALUES (10)
+    ON CONFLICT DO NOTHING;
+
+    COMMIT;`,
   ];
 }
 

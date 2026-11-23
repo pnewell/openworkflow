@@ -283,6 +283,16 @@ export function migrations(): string[] {
 
     INSERT OR IGNORE INTO "openworkflow_migrations" ("version")
     VALUES (9);`,
+
+    // 10 - schedule overlap
+    `ALTER TABLE "workflow_schedules" ADD COLUMN "overlap" TEXT NOT NULL DEFAULT 'allow';
+
+    CREATE INDEX "workflow_runs_workflow_schedule_id_idx"
+    ON "workflow_runs" ("namespace_id", "workflow_schedule_id")
+    WHERE "workflow_schedule_id" IS NOT NULL AND "status" IN ('pending', 'running', 'sleeping');
+
+    INSERT OR IGNORE INTO "openworkflow_migrations" ("version")
+    VALUES (10);`,
   ];
 }
 

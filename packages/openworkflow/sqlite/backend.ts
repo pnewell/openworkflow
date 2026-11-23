@@ -157,11 +157,12 @@ export class BackendSqlite implements Backend {
       .prepare(
         `
       INSERT INTO workflow_schedules
-        (namespace_id,id,workflow_name,input,cron,timezone,next_run_at,created_at,updated_at)
-      VALUES (?,?,?,?,?,?,?,?,?)
+        (namespace_id,id,workflow_name,input,cron,timezone,overlap,next_run_at,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?)
       ON CONFLICT(namespace_id,id) DO UPDATE SET
         workflow_name=excluded.workflow_name, input=excluded.input,
-        cron=excluded.cron, timezone=excluded.timezone, updated_at=excluded.updated_at,
+        cron=excluded.cron, timezone=excluded.timezone, overlap=excluded.overlap,
+        updated_at=excluded.updated_at,
         next_run_at=CASE WHEN workflow_schedules.next_run_at IS NOT NULL
           AND (workflow_schedules.cron<>excluded.cron OR workflow_schedules.timezone<>excluded.timezone)
           THEN excluded.next_run_at ELSE workflow_schedules.next_run_at END
@@ -175,6 +176,7 @@ export class BackendSqlite implements Backend {
         toJSON(params.input),
         params.cron,
         params.timezone,
+        params.overlap,
         nextScheduleOccurrence(params, now).toISOString(),
         now.toISOString(),
         now.toISOString(),
@@ -274,12 +276,12 @@ export class BackendSqlite implements Backend {
       // safety: SELECT reads due schedules while holding the writer lock.
       const rows = this.db
         .prepare(
-          `SELECT id,workflow_name,input,cron,timezone FROM workflow_schedules
+          `SELECT id,workflow_name,input,cron,timezone,overlap FROM workflow_schedules
         WHERE namespace_id=? AND next_run_at<=? ORDER BY next_run_at,id LIMIT ?`,
         )
         .all(this.namespaceId, before, params.limit) as Pick<
         WorkflowScheduleRow,
-        "id" | "workflow_name" | "input" | "cron" | "timezone"
+        "id" | "workflow_name" | "input" | "cron" | "timezone" | "overlap"
       >[];
       const update = this.db
         .prepare(`UPDATE workflow_schedules SET next_run_at=?,updated_at=?
@@ -288,6 +290,9 @@ export class BackendSqlite implements Backend {
         (namespace_id,id,workflow_name,status,config,input,attempts,
          workflow_schedule_id,available_at,created_at,updated_at)
         VALUES (?,?,?,'pending','{}',?,0,?,?,?,?)`);
+      const unfinished = this.db.prepare(`SELECT 1 FROM workflow_runs
+        WHERE namespace_id=? AND workflow_schedule_id=?
+          AND status IN ('pending','running','sleeping') LIMIT 1`);
       for (const row of rows) {
         update.run(
           nextScheduleOccurrence(row, params.before).toISOString(),
@@ -295,6 +300,8 @@ export class BackendSqlite implements Backend {
           this.namespaceId,
           row.id,
         );
+        if (row.overlap === "skip" && unfinished.get(this.namespaceId, row.id))
+          continue;
         const currentTime = now();
         insert.run(
           this.namespaceId,
@@ -1737,6 +1744,7 @@ interface WorkflowScheduleRow extends Record<string, SQLOutputValue> {
   input: string | null;
   cron: string;
   timezone: string;
+  overlap: string;
   next_run_at: string | null;
   created_at: string;
   updated_at: string;
@@ -1755,6 +1763,8 @@ function rowToWorkflowSchedule(row: WorkflowScheduleRow): WorkflowSchedule {
     input: fromJSON(row.input),
     cron: row.cron,
     timezone: row.timezone,
+    // safety: the overlap column is written from WorkflowScheduleDefinition.overlap.
+    overlap: row.overlap as WorkflowSchedule["overlap"],
     nextRunAt: fromISO(row.next_run_at),
     createdAt: new Date(row.created_at),
     updatedAt: new Date(row.updated_at),

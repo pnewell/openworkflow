@@ -9,6 +9,7 @@ describe("dashboard schedule administration", () => {
     workflowName: "report",
     cron: "0 9 * * 1-5",
     timezone: "America/Chicago",
+    overlap: "skip" as const,
     input: '{"accountId":"acme"}',
     mode: "create" as const,
   };
@@ -26,6 +27,7 @@ describe("dashboard schedule administration", () => {
       id: data.id,
       workflowName: data.workflowName,
       timezone: data.timezone,
+      overlap: data.overlap,
       input: { accountId: "acme" },
     });
     expect(created.nextRunAt?.getTime()).toBeGreaterThan(Date.now());

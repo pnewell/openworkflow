@@ -36,8 +36,25 @@ describe("schedule registration validation", () => {
     ).toMatchObject({
       id: "report",
       timezone: "UTC",
+      overlap: "allow",
       input: null,
     });
+  });
+
+  test("rejects an overlap other than allow or skip", async () => {
+    expect(
+      await prepareWorkflowSchedule(spec, null, {
+        cron: "* * * * *",
+        overlap: "skip",
+      }),
+    ).toMatchObject({ overlap: "skip" });
+    await expect(
+      prepareWorkflowSchedule(spec, null, {
+        cron: "* * * * *",
+        // @ts-expect-error Exercise untyped JavaScript callers.
+        overlap: "queue",
+      }),
+    ).rejects.toThrow("overlap");
   });
 
   test.each([

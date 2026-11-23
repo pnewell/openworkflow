@@ -245,12 +245,13 @@ export class BackendPostgres implements Backend {
     const now = new Date();
     const [row] = await pg<WorkflowSchedule[]>`
       INSERT INTO ${pg(this.schema)}."workflow_schedules" AS s
-        (namespace_id,id,workflow_name,input,cron,timezone,next_run_at,created_at,updated_at)
+        (namespace_id,id,workflow_name,input,cron,timezone,overlap,next_run_at,created_at,updated_at)
       VALUES (${this.namespaceId},${params.id},${params.workflowName},${pg.json(params.input)},
-        ${params.cron},${params.timezone},${nextScheduleOccurrence(params, now)},${now},${now})
+        ${params.cron},${params.timezone},${params.overlap},${nextScheduleOccurrence(params, now)},${now},${now})
       ON CONFLICT(namespace_id,id) DO UPDATE SET
         workflow_name=excluded.workflow_name, input=excluded.input,
-        cron=excluded.cron, timezone=excluded.timezone, updated_at=excluded.updated_at,
+        cron=excluded.cron, timezone=excluded.timezone, overlap=excluded.overlap,
+        updated_at=excluded.updated_at,
         next_run_at=CASE WHEN s.next_run_at IS NOT NULL
           AND (s.cron<>excluded.cron OR s.timezone<>excluded.timezone)
           THEN excluded.next_run_at ELSE s.next_run_at END
@@ -341,14 +342,19 @@ export class BackendPostgres implements Backend {
           UPDATE ${tx(this.schema)}."workflow_schedules" s
           SET next_run_at=a.next_run_at,updated_at=${params.before}
           FROM advances a WHERE s.namespace_id=${this.namespaceId} AND s.id=a.id
-          RETURNING s.namespace_id,s.id,s.workflow_name,s.input
+          RETURNING s.namespace_id,s.id,s.workflow_name,s.input,s.overlap
         )
         INSERT INTO ${tx(this.schema)}."workflow_runs"
           (namespace_id,id,workflow_name,status,config,input,attempts,
            workflow_schedule_id,available_at,created_at,updated_at)
         SELECT namespace_id,gen_random_uuid(),workflow_name,'pending','{}'::jsonb,input,0,
           id,${params.before},date_trunc('milliseconds',clock_timestamp()),clock_timestamp()
-        FROM advanced
+        FROM advanced a
+        WHERE a.overlap='allow' OR NOT EXISTS (
+          SELECT 1 FROM ${tx(this.schema)}."workflow_runs" r
+          WHERE r.namespace_id=a.namespace_id AND r.workflow_schedule_id=a.id
+            AND r.status IN ('pending','running','sleeping')
+        )
       `;
       return schedules.length;
     });

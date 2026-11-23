@@ -9,6 +9,13 @@ import {
 import { Field, FieldDescription, FieldGroup, FieldLabel } from "./ui/field";
 import { Input } from "./ui/input";
 import { MonacoJsonEditor } from "./ui/monaco-json-editor";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "./ui/select";
 import { saveWorkflowScheduleServerFn } from "@/lib/api";
 import { PencilSimpleIcon, PlusIcon } from "@phosphor-icons/react";
 import { useNavigate, useRouter } from "@tanstack/react-router";
@@ -29,6 +36,7 @@ export function ScheduleEditor({
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [input, setInput] = useState("");
+  const [overlap, setOverlap] = useState<WorkflowSchedule["overlap"]>("allow");
   const submitLabel = schedule ? "Save Changes" : "Create Schedule";
 
   function changeOpen(next: boolean) {
@@ -40,6 +48,7 @@ export function ScheduleEditor({
           ? ""
           : JSON.stringify(schedule.input, null, 2),
       );
+      setOverlap(schedule?.overlap ?? "allow");
     }
     setOpen(next);
   }
@@ -58,6 +67,7 @@ export function ScheduleEditor({
           workflowName,
           cron: readFormField(form, "cron"),
           timezone: readFormField(form, "timezone"),
+          overlap,
           input,
           mode: schedule ? "edit" : "create",
         },
@@ -110,6 +120,28 @@ export function ScheduleEditor({
           >
             <FieldGroup>
               <ScheduleFields schedule={schedule} pending={pending} />
+              <Field>
+                <FieldLabel htmlFor="schedule-overlap">Overlap</FieldLabel>
+                <Select
+                  value={overlap}
+                  onValueChange={(value) => {
+                    if (value !== null) setOverlap(value);
+                  }}
+                  disabled={pending}
+                >
+                  <SelectTrigger id="schedule-overlap" className="w-full">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="allow">allow</SelectItem>
+                    <SelectItem value="skip">skip</SelectItem>
+                  </SelectContent>
+                </Select>
+                <FieldDescription>
+                  With skip, no run starts while an earlier run of this schedule
+                  is unfinished.
+                </FieldDescription>
+              </Field>
               <Field>
                 <FieldLabel htmlFor="schedule-input">Input (JSON)</FieldLabel>
                 <MonacoJsonEditor
